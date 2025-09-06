@@ -518,7 +518,7 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
         `;
     }
     // 変更: デフォルトファビコンの設定
-    const faviconTag = favicon ? `<link rel="icon" href="${favicon}">` : '<link rel="icon" href="/public/Rec Wiki Icon.png">';
+    const faviconTag = favicon ? `<link rel="icon" href="${favicon}">` : '<link rel="icon" href="/public/Icon.png">';
 
     return `<!doctype html>
 <html lang="${lang}">
@@ -2459,5 +2459,6 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
 
