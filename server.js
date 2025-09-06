@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS wiki_invites(
 );
 `);
 
+// 1. 既存のマイグレーション
 try {
   db.prepare("SELECT is_searchable FROM wiki_settings LIMIT 1").get();
 } catch (e) {
@@ -142,6 +143,195 @@ try {
     db.exec("ALTER TABLE wiki_settings ADD COLUMN is_searchable INTEGER DEFAULT 1;");
     console.log("✅ Added missing column: wiki_settings.is_searchable");
   }
+}
+
+// 2. レートリミット用カラム
+try {
+  db.prepare("SELECT last_wiki_created_at FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN last_wiki_created_at DATETIME;");
+    console.log("✅ Added missing column: user_profiles.last_wiki_created_at");
+  }
+}
+
+// 3. ユーザープロフィール拡張
+try {
+  db.prepare("SELECT avatar_url FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN avatar_url TEXT;");
+    console.log("✅ Added missing column: user_profiles.avatar_url");
+  }
+}
+
+try {
+  db.prepare("SELECT bio FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN bio TEXT;");
+    console.log("✅ Added missing column: user_profiles.bio");
+  }
+}
+
+try {
+  db.prepare("SELECT last_login_at FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN last_login_at DATETIME;");
+    console.log("✅ Added missing column: user_profiles.last_login_at");
+  }
+}
+
+// 4. Wiki設定拡張
+try {
+  db.prepare("SELECT allow_anonymous_edit FROM wiki_settings LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wiki_settings ADD COLUMN allow_anonymous_edit INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: wiki_settings.allow_anonymous_edit");
+  }
+}
+
+try {
+  db.prepare("SELECT max_page_size FROM wiki_settings LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wiki_settings ADD COLUMN max_page_size INTEGER DEFAULT 1048576;"); // 1MB
+    console.log("✅ Added missing column: wiki_settings.max_page_size");
+  }
+}
+
+try {
+  db.prepare("SELECT theme FROM wiki_settings LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wiki_settings ADD COLUMN theme TEXT DEFAULT 'light';");
+    console.log("✅ Added missing column: wiki_settings.theme");
+  }
+}
+
+// 5. Pages拡張
+try {
+  db.prepare("SELECT view_count FROM pages LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE pages ADD COLUMN view_count INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: pages.view_count");
+  }
+}
+
+try {
+  db.prepare("SELECT is_locked FROM pages LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE pages ADD COLUMN is_locked INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: pages.is_locked");
+  }
+}
+
+try {
+  db.prepare("SELECT tags FROM pages LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE pages ADD COLUMN tags TEXT;"); // JSON format
+    console.log("✅ Added missing column: pages.tags");
+  }
+}
+
+// 6. Wikis拡張
+try {
+  db.prepare("SELECT description FROM wikis LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wikis ADD COLUMN description TEXT;");
+    console.log("✅ Added missing column: wikis.description");
+  }
+}
+
+try {
+  db.prepare("SELECT is_public FROM wikis LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wikis ADD COLUMN is_public INTEGER DEFAULT 1;");
+    console.log("✅ Added missing column: wikis.is_public");
+  }
+}
+
+try {
+  db.prepare("SELECT updated_at FROM wikis LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wikis ADD COLUMN updated_at DATETIME;");
+    console.log("✅ Added missing column: wikis.updated_at");
+  }
+}
+
+// 7. セキュリティ関連
+try {
+  db.prepare("SELECT failed_login_attempts FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN failed_login_attempts INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: user_profiles.failed_login_attempts");
+  }
+}
+
+try {
+  db.prepare("SELECT account_locked_until FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN account_locked_until DATETIME;");
+    console.log("✅ Added missing column: user_profiles.account_locked_until");
+  }
+}
+
+// 8. 統計・分析用
+try {
+  db.prepare("SELECT total_edits FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN total_edits INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: user_profiles.total_edits");
+  }
+}
+
+try {
+  db.prepare("SELECT page_count FROM wikis LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wikis ADD COLUMN page_count INTEGER DEFAULT 0;");
+    console.log("✅ Added missing column: wikis.page_count");
+  }
+}
+
+// 9. 通知・メール設定
+try {
+  db.prepare("SELECT email_notifications FROM user_profiles LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN email_notifications INTEGER DEFAULT 1;");
+    console.log("✅ Added missing column: user_profiles.email_notifications");
+  }
+}
+
+console.log("✅ Database migrations completed!");
+
+// ========================================
+// インデックス作成（パフォーマンス向上）
+// ========================================
+
+try {
+  // よく使われる検索クエリにインデックスを追加
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pages_wiki_id ON pages(wiki_id);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pages_name ON pages(name);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_wikis_owner_id ON wikis(owner_id);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_wikis_address ON wikis(address);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);");
+  
+  console.log("✅ Database indexes created!");
+} catch (indexError) {
+  console.warn("⚠️ Index creation warning:", indexError.message);
 }
 
 // Seed allowed user
@@ -2269,4 +2459,5 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
