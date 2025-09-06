@@ -1,0 +1,23 @@
+{
+  "name": "rec-wiki",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "better-sqlite3": "^9.6.0",
+    "diff": "^8.0.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.17.3",
+    "markdown-it": "^14.1.0",
+    "multer": "^1.4.5-lts.2",
+    "passport": "^0.7.0",
+    "passport-discord": "^0.1.4",
+    "sanitize-html": "^2.13.0"
+  }
+}
