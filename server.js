@@ -1455,10 +1455,13 @@ app.get('/create-wiki', ensureCanCreate, (req, res) => {
 // --- Create wiki handler ---
 const upload = multer({ dest: uploadDir });
 // 変更: Cloudflare Turnstileとレートリミットを導入
+// 変更: Cloudflare Turnstileとレートリミットを導入（一時的にレートリミットは無効化）
 app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (req, res) => {
   const lang = req.userLang;
 
-  // 1. レートリミットチェック (5分に1回)
+  // 1. レートリミットチェック (5分に1回) - 一時的に無効化
+  // TODO: user_profiles テーブルに last_wiki_created_at カラムを追加してから有効化
+  /*
   const userProfile = db.prepare('SELECT last_wiki_created_at FROM user_profiles WHERE user_id = ?').get(req.user.id);
   if (userProfile && userProfile.last_wiki_created_at) {
     const lastCreation = new Date(userProfile.last_wiki_created_at).getTime();
@@ -1467,6 +1470,7 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
       return res.status(429).send(renderLayout('Error', `<div class="card"><p class="danger">❌ ${lang === 'ja' ? 'Wikiの作成は5分に1回までです。しばらく待ってから再度お試しください。' : 'You can only create a wiki once every 5 minutes. Please try again later.'}</p><a class="btn" href="/create-wiki">🔙 ${lang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, lang, req));
     }
   }
+  */
 
   // 2. Cloudflare Turnstile 認証
   try {
@@ -1527,8 +1531,9 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
   // owner always has admin permissions
   db.prepare('INSERT OR REPLACE INTO wiki_permissions(wiki_id, editor_id, role) VALUES (?,?,?)').run(info.lastInsertRowid, req.user.id, 'admin');
 
-  // 4. Wiki作成成功後、最終作成時刻を更新
-  db.prepare('UPDATE user_profiles SET last_wiki_created_at = ? WHERE user_id = ?').run(now, req.user.id);
+  // 4. Wiki作成成功後、最終作成時刻を更新 - 一時的に無効化
+  // TODO: user_profiles テーブルに last_wiki_created_at カラムを追加してから有効化
+  // db.prepare('UPDATE user_profiles SET last_wiki_created_at = ? WHERE user_id = ?').run(now, req.user.id);
 
   res.redirect(`/${slug}-edit`);
 });
@@ -2264,3 +2269,4 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
