@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS wiki_invites(
 );
 `);
 
+try {
+  db.prepare("SELECT is_searchable FROM wiki_settings LIMIT 1").get();
+} catch (e) {
+  if (e.message.includes("no such column")) {
+    db.exec("ALTER TABLE wiki_settings ADD COLUMN is_searchable INTEGER DEFAULT 1;");
+    console.log("✅ Added missing column: wiki_settings.is_searchable");
+  }
+}
+
 // Seed allowed user
 const seedAllowed = db.prepare('INSERT OR IGNORE INTO allowed_users(user_id) VALUES (?)');
 seedAllowed.run('1047797479665578014');
@@ -2253,4 +2262,5 @@ app.get('/api/admin/pages', ensureAdmin, (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Rec Wiki running on ${BASE_URL}`);
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
+
 });
