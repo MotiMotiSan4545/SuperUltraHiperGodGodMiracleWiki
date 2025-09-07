@@ -423,7 +423,15 @@ passport.use(new DiscordStrategy({
 // --- Middlewares ---
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(session({ secret: process.env.SESSION_SECRET || 'change_me', resave: false, saveUninitialized: false }));
+app.use(session({
+  store: new SQLiteStoreSession({ db: 'sessions.sqlite', dir: './data' }),
+  secret: process.env.SESSION_SECRET || 'change_me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    expires: false // ← ログアウトするまで有効
+  }
+}));
 app.use(passport.initialize());
 app.use(passport.session());
 app.use('/public', express.static(path.join(process.cwd(), 'public')));
@@ -2459,6 +2467,7 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
 
 
