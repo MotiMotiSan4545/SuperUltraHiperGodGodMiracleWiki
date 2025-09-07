@@ -12,6 +12,8 @@ import sanitizeHtml from 'sanitize-html';
 import Database from 'better-sqlite3';
 import axios from 'axios'; // 追加
 import { diffChars } from 'diff';
+import SQLiteStore from 'connect-sqlite3';
+const SQLiteStoreSession = SQLiteStore(session);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2476,6 +2478,7 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
 
 
