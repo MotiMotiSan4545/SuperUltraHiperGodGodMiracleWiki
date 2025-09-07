@@ -535,6 +535,15 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
   <title>${title || 'Rec Wiki'}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   ${faviconTag}
+
+    <link rel="manifest" href="/public/manifest.json">
+  <meta name="theme-color" content="#3498db">
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/public/service-worker.js');
+    }
+  </script>
+  
   <style>
     :root {
       --bg-primary: #ffffff;
@@ -2467,6 +2476,7 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
 
 
