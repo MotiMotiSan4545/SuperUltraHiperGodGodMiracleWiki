@@ -539,7 +539,7 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
   <meta property="og:site_name" content="Rec Wiki">
   <meta property="og:title" content="${title || 'Rec Wiki'}">
   <meta property="og:description" content="Rec Wikiで作成されたWikiページ">
-  <meta property="og:image" content="/public/Rec%20Wiki%20Thumbnation.png">
+  <meta property="og:image" content="/public/RecWikiThumbnation.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="theme-color" content="#3498db">
@@ -2486,6 +2486,7 @@ app.listen(PORT, () => {
   console.log(`Admin users: ${ADMIN_USERS.join(', ')}`);
 
 });
+
 
 
 
