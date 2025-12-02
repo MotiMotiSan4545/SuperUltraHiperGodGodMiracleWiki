@@ -1,1626 +1,2202 @@
-// server.js - PostgreSQL対応版
-import 'dotenv/config';
-import express from 'express';
-import session from 'express-session';
-import passport from 'passport';
-import { Strategy as DiscordStrategy } from 'passport-discord';
-import path from 'path';
-import fs from 'fs';
-import multer from 'multer';
-import MarkdownIt from 'markdown-it';
-import sanitizeHtml from 'sanitize-html';
-import pg from 'pg';
-import pgSession from 'connect-pg-simple';
-import axios from 'axios';
-import { diffChars } from 'diff';
+// index.js (PostgreSQL 対応版)
 
-const { Pool } = pg;
-const PgSession = pgSession(session);
+require("dotenv").config();
+console.log("[CHECK] index.js 開始");
+
+// --- DB Connection Setup (From replace.js logic) ---
+const { Pool } = require("pg");
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
+
+// 既存のライブラリ
+const stringSimilarity = require("string-similarity");
+const token = process.env.DISCORD_TOKEN;
+const fs = require("node:fs");
+const path = require("node:path");
+const authPanel = require("./commands/aaa/auth-panel.js");
+const { Player } = require("discord-player");
+const axios = require("axios");
+const Jimp = require("jimp");
+const express = require("express");
+const {
+    Client,
+    Collection,
+    Events,
+    GatewayIntentBits,
+    ChannelType,
+} = require("discord.js");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const ADMIN_USERS = ['1047797479665578014'];
+const PORT = process.env.PORT || 1280;
 
-// PostgreSQL接続プール
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+// --- グローバル設定変数 (メモリキャッシュ) ---
+// DBから読み込んだデータをここに保持し、Botの動作はここを参照します
+let ngWordsData = {};
+global.insultSettings = {};
+global.threadSpamSettings = new Map();
+global.spamExclusionRoles = new Map();
+global.exclusionRoles = new Map();
+let gifDetectorSettingsCache = {}; // GIF設定用キャッシュ
 
-// データベース接続確認
-pool.on('connect', () => {
-  console.log('✅ PostgreSQL connected');
-});
+// --- Database Initialization & Helper Functions ---
 
-pool.on('error', (err) => {
-  console.error('❌ PostgreSQL error:', err);
-});
-
-// ディレクトリ設定
-const dataDir = path.join(process.cwd(), 'data');
-const uploadDir = path.join(dataDir, 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
-
-// Markdown & Sanitizer
-const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
-const sanitize = (html) =>
-  sanitizeHtml(html, {
-    allowedTags: sanitizeHtml.defaults.allowedTags.concat(['img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']),
-    allowedAttributes: {
-      a: ['href', 'name', 'target', 'rel'],
-      img: ['src', 'alt', 'width', 'height']
-    },
-    allowedSchemes: ['http', 'https', 'mailto']
-  });
-
-// データベース初期化
+// データベースの初期化とテーブル作成
 async function initDatabase() {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // テーブル作成
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS allowed_users (
-        user_id TEXT PRIMARY KEY
-      );
-
-      CREATE TABLE IF NOT EXISTS wikis (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE NOT NULL,
-        address TEXT UNIQUE NOT NULL,
-        favicon TEXT,
-        owner_id TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        views INTEGER DEFAULT 0,
-        deleted_at TIMESTAMP,
-        description TEXT,
-        is_public INTEGER DEFAULT 1,
-        updated_at TIMESTAMP,
-        page_count INTEGER DEFAULT 0
-      );
-
-      CREATE TABLE IF NOT EXISTS pages (
-        id SERIAL PRIMARY KEY,
-        wiki_id INTEGER NOT NULL REFERENCES wikis(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        content TEXT NOT NULL,
-        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        deleted_at TIMESTAMP,
-        view_count INTEGER DEFAULT 0,
-        is_locked INTEGER DEFAULT 0,
-        tags TEXT,
-        UNIQUE(wiki_id, name)
-      );
-
-      CREATE TABLE IF NOT EXISTS revisions (
-        id SERIAL PRIMARY KEY,
-        page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
-        content TEXT NOT NULL,
-        editor_id TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS user_profiles (
-        user_id TEXT PRIMARY KEY,
-        display_name TEXT,
-        bio TEXT,
-        email TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        last_wiki_created_at TIMESTAMP,
-        avatar_url TEXT,
-        last_login_at TIMESTAMP,
-        failed_login_attempts INTEGER DEFAULT 0,
-        account_locked_until TIMESTAMP,
-        total_edits INTEGER DEFAULT 0,
-        email_notifications INTEGER DEFAULT 1
-      );
-
-      CREATE TABLE IF NOT EXISTS user_badges (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
-        badge_name TEXT NOT NULL,
-        badge_color TEXT NOT NULL DEFAULT '#3498db',
-        granted_by TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS user_warnings (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        issued_by TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS user_suspensions (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        type TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        issued_by TEXT NOT NULL,
-        expires_at TIMESTAMP,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS user_languages (
-        user_id TEXT PRIMARY KEY,
-        language TEXT DEFAULT 'ja'
-      );
-
-      CREATE TABLE IF NOT EXISTS wiki_settings (
-        wiki_id INTEGER PRIMARY KEY REFERENCES wikis(id) ON DELETE CASCADE,
-        mode TEXT DEFAULT 'loggedin',
-        is_searchable INTEGER DEFAULT 1,
-        allow_anonymous_edit INTEGER DEFAULT 0,
-        max_page_size INTEGER DEFAULT 1048576,
-        theme TEXT DEFAULT 'light'
-      );
-
-      CREATE TABLE IF NOT EXISTS wiki_permissions (
-        wiki_id INTEGER NOT NULL REFERENCES wikis(id) ON DELETE CASCADE,
-        editor_id TEXT NOT NULL,
-        role TEXT DEFAULT 'editor',
-        PRIMARY KEY(wiki_id, editor_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS wiki_invites (
-        id SERIAL PRIMARY KEY,
-        wiki_id INTEGER NOT NULL REFERENCES wikis(id) ON DELETE CASCADE,
-        invited_tag TEXT,
-        invited_id TEXT,
-        role TEXT DEFAULT 'editor',
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    // インデックス作成
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_pages_wiki_id ON pages(wiki_id);
-      CREATE INDEX IF NOT EXISTS idx_pages_name ON pages(name);
-      CREATE INDEX IF NOT EXISTS idx_wikis_owner_id ON wikis(owner_id);
-      CREATE INDEX IF NOT EXISTS idx_wikis_address ON wikis(address);
-      CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);
-      CREATE INDEX IF NOT EXISTS idx_revisions_page_id ON revisions(page_id);
-      CREATE INDEX IF NOT EXISTS idx_revisions_editor_id ON revisions(editor_id);
-    `);
-
-    // 初期データ挿入
-    await client.query(
-      'INSERT INTO allowed_users(user_id) VALUES ($1) ON CONFLICT DO NOTHING',
-      ['1047797479665578014']
-    );
-
-    await client.query('COMMIT');
-    console.log('✅ Database initialized successfully');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('❌ Database initialization error:', error);
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-// 言語辞書
-const i18n = {
-  ja: {
-    home: 'ホーム',
-    login: 'Discordでログイン',
-    logout: 'ログアウト',
-    createWiki: 'Wiki作成',
-    profile: 'プロフィール',
-    dashboard: 'ダッシュボード',
-    admin: '管理者',
-    settings: '設定',
-    edit: '編集',
-    view: '表示',
-    delete: '削除',
-    save: '保存',
-    cancel: 'キャンセル',
-    confirm: '確認',
-    warning: '警告',
-    suspend: '停止',
-    ban: '永久停止',
-    wikiNotFound: 'Wikiが見つかりません',
-    pageNotFound: 'ページが見つかりません',
-    noPermission: '権限がありません',
-    popularWikis: '人気のWiki',
-    recentEdits: '最近の編集',
-    stats: '統計',
-    users: 'ユーザー',
-    pages: 'ページ',
-    wikis: 'Wiki一覧'
-  },
-  en: {
-    home: 'Home',
-    login: 'Login with Discord',
-    logout: 'Logout',
-    createWiki: 'Create Wiki',
-    profile: 'Profile',
-    dashboard: 'Dashboard',
-    admin: 'Admin',
-    settings: 'Settings',
-    edit: 'Edit',
-    view: 'View',
-    delete: 'Delete',
-    save: 'Save',
-    cancel: 'Cancel',
-    confirm: 'Confirm',
-    warning: 'Warning',
-    suspend: 'Suspend',
-    ban: 'Ban',
-    wikiNotFound: 'Wiki not found',
-    pageNotFound: 'Page not found',
-    noPermission: 'No permission',
-    popularWikis: 'Popular Wikis',
-    recentEdits: 'Recent Edits',
-    stats: 'Stats',
-    users: 'Users',
-    pages: 'Pages',
-    wikis: 'Wikis'
-  }
-};
-
-// Passport設定
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((obj, done) => done(null, obj));
-
-passport.use(new DiscordStrategy({
-  clientID: process.env.DISCORD_CLIENT_ID,
-  clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.DISCORD_REDIRECT_URI || `${BASE_URL}/auth/discord/callback`,
-  scope: ['identify', 'email']
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const now = new Date();
-    await pool.query(`
-      INSERT INTO user_profiles (user_id, display_name, email, created_at, last_login_at) 
-      VALUES ($1, $2, $3, $4, $5) 
-      ON CONFLICT(user_id) DO UPDATE SET 
-        display_name = EXCLUDED.display_name, 
-        email = EXCLUDED.email,
-        last_login_at = EXCLUDED.last_login_at
-    `, [profile.id, profile.username, profile.email, now, now]);
-    
-    done(null, profile);
-  } catch (error) {
-    console.error('Passport error:', error);
-    done(error);
-  }
-}));
-
-// ミドルウェア
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(session({
-  store: new PgSession({
-    pool,
-    tableName: 'session'
-  }),
-  secret: process.env.SESSION_SECRET || 'change_me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30日
-    secure: process.env.NODE_ENV === 'production'
-  }
-}));
-app.use(passport.initialize());
-app.use(passport.session());
-app.use('/public', express.static(path.join(process.cwd(), 'public')));
-app.use('/uploads', express.static(uploadDir));
-app.set('trust proxy', 1);
-
-// ユーザー言語とサスペンション確認ミドルウェア
-app.use(async (req, res, next) => {
-  req.isSuspended = false;
-  if (req.isAuthenticated()) {
+    const client = await pool.connect();
     try {
-      const langResult = await pool.query(
-        'SELECT language FROM user_languages WHERE user_id = $1',
-        [req.user.id]
-      );
-      req.userLang = langResult.rows[0]?.language || 'ja';
+        await client.query('BEGIN');
+        
+        // Settings Tables (JSONBを使用して既存のデータ構造をそのまま保存します)
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS bot_ng_words (
+                guild_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_exclusion_roles (
+                guild_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_gif_settings (
+                guild_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_insult_settings (
+                guild_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_thread_spam_settings (
+                guild_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+        `);
+        
+        await client.query('COMMIT');
+        console.log("✅ データベーステーブルの初期化完了");
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("❌ データベース初期化エラー:", err);
+    } finally {
+        client.release();
+    }
+}
 
-      const suspensionResult = await pool.query(
-        'SELECT * FROM user_suspensions WHERE user_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 1',
-        [req.user.id]
-      );
-      
-      if (suspensionResult.rows.length > 0) {
-        req.isSuspended = true;
-        req.suspensionDetails = suspensionResult.rows[0];
-      }
+// 全設定をDBからメモリにロードする
+async function loadSettingsFromDB() {
+    try {
+        // NG Words
+        const ngRes = await pool.query('SELECT * FROM bot_ng_words');
+        ngWordsData = {};
+        ngRes.rows.forEach(row => {
+            ngWordsData[row.guild_id] = row.data;
+        });
+
+        // Exclusion Roles
+        const excRes = await pool.query('SELECT * FROM bot_exclusion_roles');
+        global.exclusionRoles = new Map();
+        global.spamExclusionRoles = new Map();
+        
+        excRes.rows.forEach(row => {
+            const guildId = row.guild_id;
+            const roles = row.data;
+            
+            const convertedRoles = {
+                spam: new Set(roles.spam || []),
+                profanity: new Set(roles.profanity || []),
+                inmu: new Set(roles.inmu || []),
+                link: new Set(roles.link || []),
+                threadSpam: new Set(roles.threadSpam || []),
+                profanityDetection: new Set(roles.profanityDetection || []),
+            };
+            
+            global.exclusionRoles.set(guildId, convertedRoles);
+            global.spamExclusionRoles.set(guildId, convertedRoles.spam);
+        });
+
+        // GIF Settings
+        const gifRes = await pool.query('SELECT * FROM bot_gif_settings');
+        gifDetectorSettingsCache = {};
+        gifRes.rows.forEach(row => {
+            gifDetectorSettingsCache[row.guild_id] = row.data;
+        });
+
+        // Insult Settings
+        const insultRes = await pool.query('SELECT * FROM bot_insult_settings');
+        global.insultSettings = {};
+        insultRes.rows.forEach(row => {
+            global.insultSettings[row.guild_id] = row.data;
+        });
+        
+        // Thread Spam Settings (Optional persistence)
+        const threadRes = await pool.query('SELECT * FROM bot_thread_spam_settings');
+        global.threadSpamSettings = new Map();
+        threadRes.rows.forEach(row => {
+            global.threadSpamSettings.set(row.guild_id, row.data);
+        });
+
+        console.log("✅ DBから設定をロードしました");
     } catch (error) {
-      console.error('Middleware error:', error);
+        console.error("❌ 設定ロードエラー:", error);
     }
-  } else {
-    req.userLang = req.session.language || 'ja';
-  }
-  next();
-});
-
-// ヘルパー関数
-const getText = (key, lang = 'ja') => i18n[lang]?.[key] || i18n.ja[key] || key;
-
-const createSuspensionBlock = (req) => {
-  const lang = req.userLang;
-  const body = `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? 'アカウントが停止されているため、この操作は実行できません。' : 'Your account is suspended, and you cannot perform this action.'}</p><a class="btn" href="/">戻る</a></div>`;
-  return renderLayout('Suspended', body, null, lang, req);
-};
-
-const ensureAuth = (req, res, next) => {
-  if (req.isAuthenticated()) return next();
-  return res.redirect('/auth/discord');
-};
-
-const ensureAdmin = (req, res, next) => {
-  if (!req.isAuthenticated() || !ADMIN_USERS.includes(req.user.id)) {
-    return res.status(403).send(renderLayout('Forbidden', `
-      <div class="card">
-        <p class="danger">管理者権限が必要です</p>
-        <a class="btn" href="/">戻る</a>
-      </div>
-    `, null, 'ja', req));
-  }
-  next();
-};
-
-const ensureCanCreate = (req, res, next) => {
-  if (!req.isAuthenticated()) return res.redirect('/auth/discord');
-  if (req.isSuspended) return res.status(403).send(createSuspensionBlock(req));
-  next();
-};
-
-const ensureCanAdministerWiki = async (req, res, next) => {
-  if (!req.isAuthenticated()) return res.redirect('/auth/discord');
-  if (req.isSuspended) return res.status(403).send(createSuspensionBlock(req));
-  
-  const address = req.params.address;
-  const wiki = await wikiByAddress(address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ Wiki not found.</p></div>`, null, req.userLang, req));
-
-  const permResult = await pool.query(
-    'SELECT role FROM wiki_permissions WHERE wiki_id = $1 AND editor_id = $2',
-    [wiki.id, req.user.id]
-  );
-  
-  if (wiki.owner_id === req.user.id || 
-      (permResult.rows[0]?.role === 'admin') || 
-      ADMIN_USERS.includes(req.user.id)) {
-    return next();
-  }
-
-  return res.status(403).send(renderLayout('Forbidden', `<div class="card"><p class="danger">⛔ ${req.userLang === 'ja' ? 'Wikiの管理権限がありません' : 'You do not have administrative permissions for this wiki'}.</p><a class="btn" href="/${wiki.address}">${req.userLang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, req.userLang, req));
-};
-
-const ensureCanEdit = async (req, res, next) => {
-  if (!req.isAuthenticated()) return res.redirect('/auth/discord');
-  if (req.isSuspended) return res.status(403).send(createSuspensionBlock(req));
-  
-  const address = req.params.address;
-  const wiki = await wikiByAddress(address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ ${req.userLang === 'ja' ? 'Wikiが見つかりません' : 'Wiki not found'}.</p></div>`, null, req.userLang, req));
-
-  if (wiki.owner_id === req.user.id) return next();
-  if (ADMIN_USERS.includes(req.user.id)) return next();
-
-  const permResult = await pool.query(
-    'SELECT * FROM wiki_permissions WHERE wiki_id = $1 AND editor_id = $2',
-    [wiki.id, req.user.id]
-  );
-  if (permResult.rows.length > 0) return next();
-
-  const settingResult = await pool.query(
-    'SELECT mode FROM wiki_settings WHERE wiki_id = $1',
-    [wiki.id]
-  );
-  const mode = settingResult.rows[0]?.mode || 'loggedin';
-
-  if (mode === 'anyone') return next();
-  if (mode === 'loggedin') return next();
-  
-  return res.status(403).send(renderLayout('Forbidden', `<div class="card"><p class="danger">⛔ ${req.userLang === 'ja' ? '編集権限がありません' : 'No edit permission'}.</p><a class="btn" href="/${wiki.address}">${req.userLang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, req.userLang, req));
-};
-
-const wikiByAddress = async (address) => {
-  const result = await pool.query(
-    'SELECT * FROM wikis WHERE address = $1 AND deleted_at IS NULL',
-    [address]
-  );
-  return result.rows[0];
-};
-
-const pageByWikiAndName = async (wikiId, name) => {
-  const result = await pool.query(
-    'SELECT * FROM pages WHERE wiki_id = $1 AND name = $2 AND deleted_at IS NULL',
-    [wikiId, name]
-  );
-  return result.rows[0];
-};
-
-const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
-  let suspensionBanner = '';
-  if (req && req.isSuspended) {
-    const details = req.suspensionDetails;
-    suspensionBanner = `
-      <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 20px; border-color: var(--danger-color);">
-        <h3 style="margin-top:0; color: white;">${lang === 'ja' ? 'アカウントが停止されています' : 'Account Suspended'}</h3>
-        <p style="margin-bottom:0;">${lang === 'ja' ? '理由' : 'Reason'}: ${details.reason}</p>
-      </div>
-    `;
-  }
-  
-  const faviconTag = favicon ? `<link rel="icon" href="${favicon}">` : '<link rel="icon" href="/public/Icon.png">';
-
-  return `<!doctype html>
-<html lang="${lang}">
-<head>
-  <meta charset="utf-8">
-  <title>${title || 'Rec Wiki'}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta property="og:site_name" content="Rec Wiki">
-  <meta property="og:title" content="${title || 'Rec Wiki'}">
-  <meta property="og:description" content="Rec Wikiで作成されたWikiページ">
-  <meta property="og:image" content="/public/RecWikiThumbnation.png">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta name="theme-color" content="#3498db">
-  <meta name="twitter:card" content="summary_large_image">
-  ${faviconTag}
-  <link rel="manifest" href="/public/manifest.json">
-  <style>
-    :root {
-      --bg-primary: #ffffff;
-      --bg-secondary: #f8f9fa;
-      --text-primary: #2c3e50;
-      --text-secondary: #6c757d;
-      --border-color: #dee2e6;
-      --button-bg: #ffffff;
-      --button-hover: #e9ecef;
-      --card-bg: #ffffff;
-      --code-bg: #f8f9fa;
-      --accent-color: #3498db;
-      --success-color: #27ae60;
-      --danger-color: #e74c3c;
-      --warning-color: #f39c12;
-    }
-    [data-theme="dark"] {
-      --bg-primary: #1a1a1a;
-      --bg-secondary: #2d2d2d;
-      --text-primary: #e1e1e1;
-      --text-secondary: #a0a0a0;
-      --border-color: #404040;
-      --button-bg: #2d2d2d;
-      --button-hover: #404040;
-      --card-bg: #2d2d2d;
-      --code-bg: #1e1e1e;
-      --accent-color: #5dade2;
-      --success-color: #58d68d;
-      --danger-color: #ec7063;
-      --warning-color: #f7dc6f;
-    }
-    * { box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px 20px 80px 20px;
-      line-height: 1.7;
-      background-color: var(--bg-primary);
-      color: var(--text-primary);
-      transition: background-color 0.3s ease, color 0.3s ease;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 32px;
-      padding-bottom: 16px;
-      border-bottom: 2px solid var(--border-color);
-      flex-wrap: wrap;
-    }
-    .header-left, .header-right { 
-      display: flex; 
-      align-items: center; 
-      gap: 12px; 
-      flex: 1;
-    }
-    .header-center { 
-      flex: 1; 
-      text-align: center; 
-      display: flex;
-      justify-content: center;
-      align-items: center;
-    }
-    .header-right { justify-content: flex-end; }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 16px;
-      border-radius: 8px;
-      border: 1px solid var(--border-color);
-      text-decoration: none;
-      background-color: var(--button-bg);
-      color: var(--text-primary);
-      transition: all 0.2s ease;
-      cursor: pointer;
-      font-size: 14px;
-      font-weight: 500;
-    }
-    .btn:hover { background-color: var(--button-hover); transform: translateY(-1px); }
-    .btn.primary { background-color: var(--accent-color); color: white; border-color: var(--accent-color); }
-    .btn.primary:hover { background-color: #2980b9; border-color: #2980b9; }
-    .btn.success { background-color: var(--success-color); color: white; border-color: var(--success-color); }
-    .btn.danger { background-color: var(--danger-color); color: white; border-color: var(--danger-color); }
-    .btn.disabled { pointer-events: none; cursor: not-allowed; opacity: 0.6; }
-    input, textarea, select { 
-      width: 100%; 
-      padding: 12px; 
-      border: 1px solid var(--border-color); 
-      border-radius: 8px; 
-      background-color: var(--card-bg); 
-      color: var(--text-primary); 
-      font-size: 14px; 
-    }
-    textarea { min-height: 400px; font-family: 'Monaco', 'Menlo', monospace; resize: vertical; }
-    .card { 
-      border: 1px solid var(--border-color); 
-      padding: 24px; 
-      border-radius: 12px; 
-      background-color: var(--card-bg); 
-      margin-bottom: 20px; 
-    }
-    .muted { color: var(--text-secondary); }
-    .mono { font-family: monospace; }
-    .breadcrumb { margin-bottom: 20px; font-size: 14px; }
-    .breadcrumb a { color: var(--accent-color); text-decoration: none; }
-    @media (max-width: 768px) {
-      body { padding: 16px 16px 80px 16px; }
-    }
-  </style>
-</head>
-<body data-theme="light">
-${suspensionBanner}
-<header>
-  <div class="header-left">
-    <a class="btn" href="/">🏠 ${getText('home', lang)}</a>
-  </div>
-  <div class="header-center">
-    <h1 style="margin: 0;"><a href="/" style="text-decoration: none; color: var(--text-primary);">Rec Wiki</a></h1>
-  </div>
-  <div class="header-right">
-    <button class="btn" onclick="toggleTheme()">🌓</button>
-    <div id="auth"></div>
-  </div>
-</header>
-${body}
-<script>
-function toggleTheme() {
-  const body = document.body;
-  const newTheme = body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-  body.setAttribute('data-theme', newTheme);
-  localStorage.setItem('theme', newTheme);
 }
-document.body.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
 
-fetch('/api/me').then(r => r.json()).then(me => {
-  const el = document.getElementById('auth');
-  if (!el) return;
-  if (me.loggedIn) {
-    el.innerHTML = \`<img src="\${me.avatar}" alt="avatar" style="width:36px;height:36px;border-radius:50%;">\`;
-  } else {
-    el.innerHTML = '<a class="btn primary" href="/auth/discord">${getText('login', lang)}</a>';
-  }
-});
-</script>
-</body>
-</html>`;
+// 設定保存用関数 (fs.writeFileSyncの代わり)
+async function saveNgWordsToDB(guildId, data) {
+    // メモリ更新
+    if (guildId) ngWordsData[guildId] = data;
+    // DB更新
+    try {
+        if (guildId) {
+             await pool.query(
+                `INSERT INTO bot_ng_words (guild_id, data) VALUES ($1 (¥155), <span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥311)</span>)
+                 ON CONFLICT(guild_id) DO UPDATE SET data = &lt;span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$2 (¥311)&lt;/span&gt;`,
+                [guildId, data]
+            );
+        } else {
+            // 全保存の場合（互換性のため）
+            for (const [gid, d] of Object.entries(ngWordsData)) {
+                await pool.query(
+                    `INSERT INTO bot_ng_words (guild_id, data) VALUES ($1 (¥155), <span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥311)</span>)
+                     ON CONFLICT(guild_id) DO UPDATE SET data = &lt;span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$2 (¥311)&lt;/span&gt;`,
+                    [gid, d]
+                );
+            }
+        }
+    } catch (e) {
+        console.error("Failed to save NG Words to DB:", e);
+    }
+}
+
+// 従来の saveNgWords 関数をラップ (互換性維持)
+function saveNgWords() {
+    saveNgWordsToDB(null, null); // 全保存トリガー
+}
+
+// 除外ロール保存
+global.saveExclusionRolesToDB = async function(guildId, dataObj) {
+    try {
+        await pool.query(
+            `INSERT INTO bot_exclusion_roles (guild_id, data) VALUES ($1 (¥155), <span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥311)</span>)
+             ON CONFLICT(guild_id) DO UPDATE SET data = &lt;span class="currency-converted" title="自動変換: $2 → ¥311" data-original="$2" data-jpy="311" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$2 (¥311)&lt;/span&gt;`,
+            [guildId, dataObj]
+        );
+        // メモリ更新はコマンド側で行われている前提ですが、必要ならここでもSet再構築を行う
+    } catch (e) {
+        console.error("Failed to save Exclusion Roles:", e);
+    }
 };
 
-// ===== ルート定義 =====
+// --- Bot Settings & Constants ---
 
-// 認証
-app.get('/auth/discord', passport.authenticate('discord'));
-app.get('/auth/discord/callback',
-  passport.authenticate('discord', { failureRedirect: '/' }),
-  (req, res) => res.redirect('/create-wiki')
-);
-app.get('/logout', (req, res) => {
-  req.logout(() => {});
-  res.redirect('/');
-});
+// スパム検知のための設定
+const SPAM_THRESHOLD_MESSAGES = 3;
+const SPAM_THRESHOLD_TIME_MS = 10000;
+const SIMILARITY_THRESHOLD = 0.6;
+const userMessageHistory = new Map();
 
-// API: 現在のユーザー
-app.get('/api/me', (req, res) => {
-  if (!req.isAuthenticated()) return res.json({ loggedIn: false });
-  const { id, username, discriminator, avatar } = req.user;
-  const ext = avatar && avatar.startsWith('a_') ? 'gif' : 'png';
-  const avatarUrl = avatar
-    ? `https://cdn.discordapp.com/avatars/${id}/${avatar}.${ext}?size=128`
-    : `https://cdn.discordapp.com/embed/avatars/${Number(discriminator) % 5}.png`;
-  const isAdmin = ADMIN_USERS.includes(id);
-  res.json({ loggedIn: true, id, username, discriminator, avatar: avatarUrl, isAdmin });
-});
+// スレッドスパム検知のための設定
+const THREAD_SPAM_THRESHOLD_OPERATIONS = 3;
+const THREAD_SPAM_THRESHOLD_TIME_MS = 30000;
+const THREAD_SPAM_TIMEOUT_DURATION = 600000;
+const userThreadHistory = new Map();
 
-// 言語切り替え
-app.get('/lang/:lang', async (req, res) => {
-  const { lang } = req.params;
-  if (!['ja', 'en'].includes(lang)) return res.redirect('/');
-  
-  if (req.isAuthenticated()) {
-    await pool.query(
-      'INSERT INTO user_languages(user_id, language) VALUES ($1, $2) ON CONFLICT(user_id) DO UPDATE SET language = $2',
-      [req.user.id, lang]
-    );
-  } else {
-    req.session.language = lang;
-  }
-  
-  res.redirect(req.get('Referer') || '/');
-});
+// レイド対策のための設定
+const RAID_DETECTION_WINDOW = 5 * 60 * 1000;
+const RAID_THRESHOLD_MULTIPLIER = 5;
+const MIN_RAID_MEMBERS = 5;
+const NORMAL_PERIOD_DAYS = 7;
+const joinHistory = new Map();
 
-// ホーム
-app.get('/', async (req, res) => {
-  const lang = req.userLang;
-  const isSuspended = !!req.isSuspended;
-  const disabledClass = isSuspended ? 'disabled' : '';
+const userMessageData = new Map();
+const raidModeStatus = new Map();
 
-  const body = `
-    <div class="breadcrumb">🏠 ${getText('home', lang)}</div>
-    <div style="text-align: center; margin-bottom: 24px;">
-      <h2>Welcome to Rec Wiki</h2>
-      <p class="muted">${lang === 'ja' ? 'Discord連携済みユーザーがWikiを作成できます。' : 'Discord users can create wikis.'}</p>
-      <a class="btn primary ${disabledClass}" href="/create-wiki">🆕 ${getText('createWiki', lang)}</a>
-    </div>
-    <div class="card">
-      <h3>📚 ${getText('popularWikis', lang)}</h3>
-      <div id="wiki-list">Loading...</div>
-    </div>
-    <script>
-      fetch('/api/wikis?limit=10').then(r => r.json()).then(data => {
-        const listEl = document.getElementById('wiki-list');
-        if (!data.wikis.length) {
-          listEl.innerHTML = '<p class="muted">${lang === 'ja' ? 'Wikiがまだありません。' : 'No wikis yet.'}</p>';
-          return;
-        }
-        listEl.innerHTML = data.wikis.map(w => \`
-          <div class="card">
-            <h3><a href="/\${w.address}">\${w.name}</a></h3>
-            <p class="muted">Views: \${w.views || 0}</p>
-            <a class="btn" href="/\${w.address}">📖 ${getText('view', lang)}</a>
-          </div>
-        \`).join('');
-      });
-    </script>
-  `;
-  res.send(renderLayout('Rec Wiki', body, null, lang, req));
-});
+console.log("[CHECK] 取得したPORT:", PORT);
 
-// API: Wikiリスト
-app.get('/api/wikis', async (req, res) => {
-  const skip = parseInt(req.query.skip || '0', 10);
-  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '10', 10)));
-  
-  try {
-    const result = await pool.query(`
-      SELECT w.id, w.name, w.address, w.favicon, w.created_at, w.views 
-      FROM wikis w
-      LEFT JOIN wiki_settings ws ON w.id = ws.wiki_id
-      WHERE w.deleted_at IS NULL AND (ws.is_searchable = 1 OR ws.is_searchable IS NULL)
-      ORDER BY w.views DESC, w.created_at DESC 
-      LIMIT $1 OFFSET $2
-    `, [limit, skip]);
-    
-    res.json({ wikis: result.rows, count: result.rows.length });
-  } catch (error) {
-    console.error('API wikis error:', error);
-    res.status(500).json({ error: 'Failed to fetch wikis' });
-  }
-});
+// GIF検出設定を読み込む (キャッシュから)
+function loadGifDetectorSettings() {
+    return gifDetectorSettingsCache;
+}
 
-// Wiki作成フォーム
-app.get('/create-wiki', ensureCanCreate, (req, res) => {
-  const lang = req.userLang;
-  const body = `
-    <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > 🆕 ${getText('createWiki', lang)}</div>
-    <h1>🆕 ${lang === 'ja' ? '新しいWikiを作成' : 'Create a New Wiki'}</h1>
-    <form action="/create-wiki" method="post" enctype="multipart/form-data" class="card">
-      <div class="form-group">
-        <label>📝 ${lang === 'ja' ? 'Wiki名(表示名、一意)' : 'Wiki Name (Display Name, Unique)'}</label>
-        <input name="name" required placeholder="e.g., MyTeamWiki" maxlength="100">
-      </div>
-      <div class="form-group">
-        <label>🔗 ${lang === 'ja' ? 'アドレス(URL用、一意、英数字とハイフンのみ)' : 'Address (For URL, Unique, Alphanumeric & Hyphens only)'}</label>
-        <input name="address" required pattern="[a-zA-Z0-9-]{2,64}" placeholder="e.g., my-team-wiki" maxlength="64">
-      </div>
-      <div class="form-group">
-        <label>🌐 ${lang === 'ja' ? 'ファビコンURL(オプション)' : 'Favicon URL (Optional)'}</label>
-        <input name="faviconUrl" placeholder="https://.../favicon.png">
-      </div>
-      <div class="form-group">
-        <label>🔒 ${lang === 'ja' ? '初期公開設定' : 'Initial Access Setting'}</label>
-        <select name="initialMode">
-          <option value="loggedin" selected>${lang === 'ja' ? 'ログインユーザーのみ(デフォルト)' : 'Logged-in users only (Default)'}</option>
-          <option value="anyone">${lang === 'ja' ? '誰でも(公開編集)' : 'Anyone (Public editing)'}</option>
-          <option value="invite">${lang === 'ja' ? '招待のみ(オーナーが招待)' : 'Invite only (Owner invites)'}</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <div class="cf-turnstile" data-sitekey="${process.env.TURNSTILE_SITE_KEY || '1x00000000000000000000AA'}"></div>
-      </div>
-      <button class="btn success" type="submit">🚀 ${lang === 'ja' ? '作成' : 'Create'}</button>
-    </form>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-  `;
-  res.send(renderLayout(`${getText('createWiki', lang)}`, body, null, lang, req));
-});
+// 色の明度を計算(0-255)
+function getLuminance(r, g, b) {
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+}
 
-// Wiki作成処理
-const upload = multer({ dest: uploadDir });
-app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (req, res) => {
-  const lang = req.userLang;
+// RGBから色相を計算(0-360)
+function getHue(r, g, b) {
+    r /= 255;
+    g /= 255;
+    b /= 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
 
-  // Cloudflare Turnstile認証
-  try {
-    const token = req.body['cf-turnstile-response'];
-    const ip = req.headers['cf-connecting-ip'] || req.ip;
+    if (delta === 0) return 0;
 
-    const formData = new URLSearchParams();
-    formData.append('secret', process.env.TURNSTILE_SECRET_KEY);
-    formData.append('response', token);
-    formData.append('remoteip', ip);
-
-    const result = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', formData);
-    if (!result.data.success) {
-      return res.status(403).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? '認証に失敗しました。' : 'Authentication failed.'}</p></div>`, null, lang, req));
-    }
-  } catch (error) {
-    console.error('Turnstile verification failed:', error.message);
-    return res.status(500).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? '認証サーバーでエラーが発生しました。' : 'Authentication server error.'}</p></div>`, null, lang, req));
-  }
-  
-  const { name, address, faviconUrl, initialMode } = req.body;
-  const slug = (address || '').trim();
-  const wname = (name || '').trim();
-
-  if (!/^[a-zA-Z0-9-]{2,64}$/.test(slug)) {
-    return res.status(400).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? '無効なアドレス形式です。' : 'Invalid address format.'}</p><a class="btn" href="/create-wiki">🔙 Back</a></div>`, null, lang, req));
-  }
-  if (!wname) {
-    return res.status(400).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? 'Wiki名は必須です。' : 'Wiki name is required.'}</p><a class="btn" href="/create-wiki">🔙 Back</a></div>`, null, lang, req));
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const existsResult = await client.query(
-      'SELECT 1 FROM wikis WHERE name = $1 OR address = $2',
-      [wname, slug]
-    );
-    
-    if (existsResult.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).send(renderLayout('Duplicate', `<div class="card"><p class="danger">⛔ ${lang === 'ja' ? 'Wiki名またはアドレスが既に使用されています。' : 'Wiki name or address already in use.'}</p><a class="btn" href="/create-wiki">🔙 Back</a></div>`, null, lang, req));
-    }
-
-    let faviconPath = (faviconUrl && /^https?:\/\//.test(faviconUrl)) ? faviconUrl.trim() : null;
-    if (req.file) {
-      faviconPath = `/uploads/${req.file.filename}`;
-    }
-
-    const wikiResult = await client.query(
-      'INSERT INTO wikis(name, address, favicon, owner_id) VALUES ($1, $2, $3, $4) RETURNING id',
-      [wname, slug, faviconPath, req.user.id]
-    );
-    const wikiId = wikiResult.rows[0].id;
-
-    const welcomeText = lang === 'ja' ? 
-      `# ${wname}\n\n🎉 このWikiへようこそ！\n\n## はじめに\nこのページを編集してWikiを構築しましょう。\n\n## 機能\n- 📝 Markdownでページ作成\n- 🖼️ 画像アップロード対応\n- 🌓 ダークテーマ切替\n- 📱 レスポンシブデザイン\n- 📚 改訂履歴` :
-      `# ${wname}\n\n🎉 Welcome to this Wiki!\n\n## Getting Started\nEdit this page to start building your wiki.\n\n## Features\n- 📝 Create pages with Markdown\n- 🖼️ Image upload support\n- 🌓 Dark theme toggle\n- 📱 Responsive design\n- 📚 Revision history`;
-
-    const pageResult = await client.query(
-      'INSERT INTO pages(wiki_id, name, content) VALUES ($1, $2, $3) RETURNING id',
-      [wikiId, 'home', welcomeText]
-    );
-    const pageId = pageResult.rows[0].id;
-
-    await client.query(
-      'INSERT INTO revisions(page_id, content, editor_id) VALUES ($1, $2, $3)',
-      [pageId, welcomeText, req.user.id]
-    );
-
-    const mode = ['anyone', 'loggedin', 'invite'].includes(initialMode) ? initialMode : 'loggedin';
-    await client.query(
-      'INSERT INTO wiki_settings(wiki_id, mode) VALUES ($1, $2)',
-      [wikiId, mode]
-    );
-
-    await client.query(
-      'INSERT INTO wiki_permissions(wiki_id, editor_id, role) VALUES ($1, $2, $3)',
-      [wikiId, req.user.id, 'admin']
-    );
-
-    await client.query('COMMIT');
-    res.redirect(`/${slug}-edit`);
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Create wiki error:', error);
-    res.status(500).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ Wiki作成に失敗しました。</p></div>`, null, lang, req));
-  } finally {
-    client.release();
-  }
-});
-
-// Wiki編集ダッシュボード
-app.get('/:address-edit', ensureCanEdit, async (req, res) => {
-  const lang = req.userLang;
-  const wiki = await wikiByAddress(req.params.address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
-
-  try {
-    const pagesResult = await pool.query(
-      'SELECT name FROM pages WHERE wiki_id = $1 AND deleted_at IS NULL ORDER BY name ASC',
-      [wiki.id]
-    );
-    const pages = pagesResult.rows;
-
-    const settingsResult = await pool.query(
-      'SELECT mode, is_searchable FROM wiki_settings WHERE wiki_id = $1',
-      [wiki.id]
-    );
-    const settings = settingsResult.rows[0] || { mode: 'loggedin', is_searchable: 1 };
-
-    const permsResult = await pool.query(
-      'SELECT editor_id, role FROM wiki_permissions WHERE wiki_id = $1',
-      [wiki.id]
-    );
-    const perms = permsResult.rows;
-
-    const invitesResult = await pool.query(
-      'SELECT id, invited_tag, invited_id, role, created_at FROM wiki_invites WHERE wiki_id = $1 ORDER BY created_at DESC',
-      [wiki.id]
-    );
-    const invites = invitesResult.rows;
-
-    const allPages = pages.map(p => `<a class="chip" href="/${wiki.address}/${encodeURIComponent(p.name)}/edit">📄 ${p.name}</a>`).join('');
-    const permsHtml = perms.map(p => `<div><strong>${p.editor_id}</strong> — <span class="muted">${p.role}</span></div>`).join('') || `<div class="muted">${lang === 'ja' ? '明示的な編集者なし' : 'No explicit editors'}</div>`;
-    const invitesHtml = invites.map(i => `<div><strong>${i.invited_tag || (i.invited_id || '—')}</strong> — <span class="muted">${i.role}</span></div>`).join('') || `<div class="muted">${lang === 'ja' ? '保留中の招待なし' : 'No pending invites'}</div>`;
-
-    const isOwner = wiki.owner_id === req.user.id;
-    const isAdmin = ADMIN_USERS.includes(req.user.id);
-    const canChangeAdvancedSettings = isOwner || isAdmin;
-
-    let advancedSettingsHtml = '';
-    if (canChangeAdvancedSettings) {
-      advancedSettingsHtml = `
-        <hr style="margin:16px 0;">
-        <h3>🔍 ${lang === 'ja' ? '検索掲載' : 'Search Indexing'}</h3>
-        <div class="form-group">
-          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-            <input type="checkbox" name="is_searchable" ${settings.is_searchable ? 'checked' : ''} form="perm-form">
-            <span>${lang === 'ja' ? '検索エンジンやWiki一覧に掲載する' : 'Allow listing in search engines'}</span>
-          </label>
-        </div>
-      `;
-    }
-    
-    const body = `
-      <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > <a href="/${wiki.address}">📚 ${wiki.name}</a> > ✏️ ${getText('edit', lang)} Dashboard</div>
-      <h1>✏️ ${wiki.name} Dashboard</h1>
-      <div class="row">
-        <div class="card">
-          <h2>📄 ${getText('pages', lang)} (${pages.length})</h2>
-          <div class="list">${allPages || `<span class="muted">${lang === 'ja' ? 'ページがまだありません' : 'No pages yet'}.</span>`}</div>
-          <form onsubmit="event.preventDefault(); location.href='/${wiki.address}/'+encodeURIComponent(this.page.value)+'/edit'">
-            <div class="form-group">
-              <label>🔍 ${lang === 'ja' ? '新規または既存のページ名' : 'New or Existing Page Name'}</label>
-              <input name="page" required placeholder="e.g., getting-started">
-            </div>
-            <button class="btn success" type="submit">🚀 ${lang === 'ja' ? 'エディタを開く' : 'Open Editor'}</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h2>📊 Wiki ${lang === 'ja' ? '情報' : 'Info'}</h2>
-          <p><strong>📝 ${lang === 'ja' ? 'アドレス' : 'Address'}:</strong> ${wiki.address}</p>
-          <p><strong>👁️ ${lang === 'ja' ? '閲覧数' : 'Views'}:</strong> ${wiki.views || 0}</p>
-          <p><strong>📄 ${getText('pages', lang)}:</strong> ${pages.length}</p>
-
-          <hr style="margin:16px 0;">
-          <h3>🔒 ${lang === 'ja' ? '権限設定' : 'Permission Settings'}</h3>
-          <form id="perm-form" action="/${wiki.address}/settings" method="post">
-            <div class="form-group">
-              <label>${lang === 'ja' ? '公開モード' : 'Access Mode'}</label>
-              <select name="mode">
-                <option value="anyone" ${settings.mode === 'anyone' ? 'selected' : ''}>${lang === 'ja' ? '誰でも' : 'Anyone'}</option>
-                <option value="loggedin" ${settings.mode === 'loggedin' ? 'selected' : ''}>${lang === 'ja' ? 'ログインユーザー' : 'Logged-in users'}</option>
-                <option value="invite" ${settings.mode === 'invite' ? 'selected' : ''}>${lang === 'ja' ? '招待のみ' : 'Invite only'}</option>
-              </select>
-            </div>
-            ${advancedSettingsHtml}
-            <button class="btn" type="submit">${getText('save', lang)}</button>
-          </form>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="card">
-          <h3>👥 ${lang === 'ja' ? '編集者リスト' : 'Editors List'}</h3>
-          ${permsHtml}
-          <form id="add-perm" onsubmit="event.preventDefault(); addPermission();">
-            <div class="form-group">
-              <label>Discord ID</label>
-              <input name="editor_id" placeholder="123456789012345678">
-            </div>
-            <div class="form-group">
-              <label>${lang === 'ja' ? '役割' : 'Role'}</label>
-              <input name="role" placeholder="editor / admin">
-            </div>
-            <button class="btn" type="submit">${lang === 'ja' ? '追加' : 'Add'}</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>✉️ ${lang === 'ja' ? '招待' : 'Invites'}</h3>
-          ${invitesHtml}
-          <form id="invite-form" onsubmit="event.preventDefault(); sendInvite();">
-            <div class="form-group">
-              <label>Discord Tag</label>
-              <input name="invited_tag" placeholder="Username#1234">
-            </div>
-            <div class="form-group">
-              <label>${lang === 'ja' ? '役割' : 'Role'}</label>
-              <input name="role" placeholder="editor">
-            </div>
-            <button class="btn" type="submit">${lang === 'ja' ? '招待を作成' : 'Create Invite'}</button>
-          </form>
-        </div>
-      </div>
-
-      <script>
-        async function addPermission() {
-          const form = document.getElementById('add-perm');
-          const editor_id = form.editor_id.value.trim();
-          const role = form.role.value.trim() || 'editor';
-          if (!editor_id) return alert('Discord IDを入力してください');
-          const res = await fetch('/${wiki.address}/permissions', { 
-            method: 'POST', 
-            headers: {'Content-Type':'application/json'}, 
-            body: JSON.stringify({ editor_id, role })
-          });
-          if (res.ok) location.reload();
-          else alert('Failed to add permission');
-        }
-
-        async function sendInvite() {
-          const form = document.getElementById('invite-form');
-          const invited_tag = form.invited_tag.value.trim();
-          const role = form.role.value.trim() || 'editor';
-          if (!invited_tag) return alert('Discord Tagを入力してください');
-          const res = await fetch('/${wiki.address}/invite', { 
-            method: 'POST', 
-            headers: {'Content-Type':'application/json'}, 
-            body: JSON.stringify({ invited_tag, role })
-          });
-          if (res.ok) { alert('招待を作成しました'); location.reload(); }
-          else { alert('招待に失敗しました'); }
-        }
-      </script>
-    `;
-    res.send(renderLayout(`${wiki.name} ${getText('edit', lang)}`, body, wiki.favicon, lang, req));
-  } catch (error) {
-    console.error('Edit dashboard error:', error);
-    res.status(500).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ エラーが発生しました</p></div>`, null, lang, req));
-  }
-});
-
-// Wiki設定更新
-app.post('/:address/settings', ensureCanAdministerWiki, async (req, res) => {
-  const wiki = await wikiByAddress(req.params.address);
-  if (!wiki) return res.status(404).send('Wiki not found');
-  
-  const mode = ['anyone', 'loggedin', 'invite'].includes(req.body.mode) ? req.body.mode : 'loggedin';
-  const isSearchable = req.body.is_searchable === 'on' ? 1 : 0;
-  
-  const isOwner = wiki.owner_id === req.user.id;
-  const isAdmin = ADMIN_USERS.includes(req.user.id);
-
-  try {
-    if (isOwner || isAdmin) {
-      await pool.query(`
-        INSERT INTO wiki_settings (wiki_id, mode, is_searchable) 
-        VALUES ($1, $2, $3) 
-        ON CONFLICT(wiki_id) DO UPDATE SET 
-          mode = EXCLUDED.mode, 
-          is_searchable = EXCLUDED.is_searchable
-      `, [wiki.id, mode, isSearchable]);
+    let hue;
+    if (max === r) {
+        hue = ((g - b) / delta + (g < b ? 6 : 0)) / 6;
+    } else if (max === g) {
+        hue = ((b - r) / delta + 2) / 6;
     } else {
-      await pool.query(
-        'UPDATE wiki_settings SET mode = $1 WHERE wiki_id = $2',
-        [mode, wiki.id]
-      );
+        hue = ((r - g) / delta + 4) / 6;
     }
 
-    res.redirect(`/${wiki.address}-edit`);
-  } catch (error) {
-    console.error('Settings update error:', error);
-    res.status(500).send('Failed to update settings');
-  }
-});
+    return hue * 360;
+}
 
-// 権限追加
-app.post('/:address/permissions', ensureCanAdministerWiki, async (req, res) => {
-  const wiki = await wikiByAddress(req.params.address);
-  if (!wiki) return res.status(404).json({ error: 'not found' });
-  
-  const { editor_id, role } = req.body;
-  if (!editor_id) return res.status(400).json({ error: 'missing editor_id' });
-  
-  try {
-    await pool.query(
-      'INSERT INTO wiki_permissions(wiki_id, editor_id, role) VALUES ($1, $2, $3) ON CONFLICT(wiki_id, editor_id) DO UPDATE SET role = $3',
-      [wiki.id, editor_id, role || 'editor']
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Permissions error:', error);
-    res.status(500).json({ error: 'failed' });
-  }
-});
+/**
+ * ピクセルバッファから平均色・輝度・色相を計算する
+ */
+function calculateAverageFromPixels(pixelBuffer, sampleRate = 100) {
+    let totalR = 0,
+        totalG = 0,
+        totalB = 0;
+    let pixelCount = 0;
 
-// 招待作成
-app.post('/:address/invite', ensureCanAdministerWiki, async (req, res) => {
-  const wiki = await wikiByAddress(req.params.address);
-  if (!wiki) return res.status(404).json({ error: 'not found' });
-  
-  const { invited_tag, role } = req.body;
-  if (!invited_tag) return res.status(400).json({ error: 'missing invited_tag' });
-  
-  try {
-    await pool.query(
-      'INSERT INTO wiki_invites(wiki_id, invited_tag, role) VALUES ($1, $2, $3)',
-      [wiki.id, invited_tag, role || 'editor']
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Invite error:', error);
-    res.status(500).json({ error: 'failed' });
-  }
-});
+    for (let i = 0; i < pixelBuffer.length; i += 4 * sampleRate) {
+        if (pixelBuffer[i + 3] === 0) {
+            continue;
+        }
 
-// ページ編集
-app.get('/:address/:page/edit', ensureCanEdit, async (req, res) => {
-  const { address, page } = req.params;
-  const lang = req.userLang;
-  const wiki = await wikiByAddress(address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
-
-  const pg = await pageByWikiAndName(wiki.id, page);
-  const content = pg ? pg.content : '';
-
-  const body = `
-    <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > <a href="/${wiki.address}">📚 ${wiki.name}</a> > <a href="/${wiki.address}/${encodeURIComponent(page)}">📄 ${page}</a> > ✏️ ${getText('edit', lang)}</div>
-    <h1>✏️ ${wiki.name} / ${page}</h1>
-    <form method="post" action="/${wiki.address}/${encodeURIComponent(page)}/edit" class="card">
-      <div class="form-group">
-        <label>📄 Markdown Content</label>
-        <textarea name="content" placeholder="# Start with a heading!">${content.replace(/</g,'&lt;')}</textarea>
-      </div>
-      <button class="btn success" type="submit">💾 ${getText('save', lang)}</button>
-    </form>
-  `;
-  res.send(renderLayout(`${wiki.name}/${page} ${getText('edit', lang)}`, body, wiki.favicon, lang, req));
-});
-
-// ページ保存
-app.post('/:address/:page/edit', ensureCanEdit, async (req, res) => {
-  const { address, page } = req.params;
-  const wiki = await wikiByAddress(address);
-  if (!wiki) return res.status(404).send('Wiki not found');
-
-  const content = (req.body.content ?? '').toString();
-  const pg = await pageByWikiAndName(wiki.id, page);
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    if (pg) {
-      await client.query(
-        'UPDATE pages SET content = $1, updated_at = NOW() WHERE id = $2',
-        [content, pg.id]
-      );
-      await client.query(
-        'INSERT INTO revisions(page_id, content, editor_id) VALUES ($1, $2, $3)',
-        [pg.id, content, req.user.id]
-      );
-    } else {
-      const pageResult = await client.query(
-        'INSERT INTO pages(wiki_id, name, content) VALUES ($1, $2, $3) RETURNING id',
-        [wiki.id, page, content]
-      );
-      const pageId = pageResult.rows[0].id;
-      await client.query(
-        'INSERT INTO revisions(page_id, content, editor_id) VALUES ($1, $2, $3)',
-        [pageId, content, req.user.id]
-      );
+        totalR += pixelBuffer[i];
+        totalG += pixelBuffer[i + 1];
+        totalB += pixelBuffer[i + 2];
+        pixelCount++;
     }
 
-    await client.query('COMMIT');
-    res.redirect(`/${address}/${encodeURIComponent(page)}`);
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Page save error:', error);
-    res.status(500).send('Failed to save page');
-  } finally {
-    client.release();
-  }
-});
+    if (pixelCount === 0) {
+        return { luminance: 0, hue: 0, r: 0, g: 0, b: 0 };
+    }
 
-// ページ表示
-app.get('/:address/:page', async (req, res) => {
-  const { address, page } = req.params;
-  const lang = req.userLang;
-  const wiki = await wikiByAddress(address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
+    const avgR = Math.round(totalR / pixelCount);
+    const avgG = Math.round(totalG / pixelCount);
+    const avgB = Math.round(totalB / pixelCount);
 
-  const pg = await pageByWikiAndName(wiki.id, page);
-  if (!pg) {
-    return res.status(404).send(renderLayout(`${wiki.name}/${page}`, `
-      <div class="card" style="text-align: center;">
-        <h1>📄 ${page}</h1>
-        <p class="muted">${lang === 'ja' ? 'このページはまだ作成されていません。' : 'This page has not been created yet.'}</p>
-        <a class="btn primary" href="/${wiki.address}/${encodeURIComponent(page)}/edit">🆕 ${lang === 'ja' ? 'このページを作成' : 'Create this Page'}</a>
-      </div>
-    `, wiki.favicon, lang, req));
-  }
+    const luminance = getLuminance(avgR, avgG, avgB);
+    const hue = getHue(avgR, avgG, avgB);
 
-  try {
-    await pool.query('UPDATE wikis SET views = COALESCE(views, 0) + 1 WHERE id = $1', [wiki.id]);
-  } catch (e) {
-    console.warn('views update failed', e.message);
-  }
+    return { luminance, hue, r: avgR, g: avgG, b: avgB };
+}
 
-  const html = sanitize(md.render(pg.content));
-  const body = `
-    <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > <a href="/${wiki.address}">📚 ${wiki.name}</a> > 📄 ${pg.name}</div>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-      <h1>📄 ${pg.name}</h1>
-      <div style="display: flex; gap: 8px;">
-        <a class="btn" href="/${wiki.address}/${encodeURIComponent(pg.name)}/edit">✏️ ${getText('edit', lang)}</a>
-      </div>
-    </div>
-    <div class="card content">${html}</div>
-    <div class="card"><p class="muted">📅 ${lang === 'ja' ? '最終更新' : 'Last Updated'}: ${new Date(pg.updated_at).toLocaleString(lang === 'ja' ? 'ja-JP' : 'en-US')}</p></div>
-  `;
-  res.send(renderLayout(`${wiki.name}/${pg.name}`, body, wiki.favicon, lang, req));
-});
+// URLからGIF画像を検出する関数(Imgur対応版)
+function extractImageUrlsFromMessage(content) {
+    const urls = [];
 
-// Wikiホームへリダイレクト
-app.get('/:address', async (req, res) => {
-  const wiki = await wikiByAddress(req.params.address);
-  const lang = req.userLang;
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">⛔ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
-  res.redirect(`/${wiki.address}/home`);
-});
+    const urlPattern =
+        /(https?:\/\/[^\s]+\.(?:gif|png|jpg|jpeg|webp)(?:\?[^\s]*)?)/gi;
+    const matches = content.match(urlPattern);
 
-// ダッシュボード
-app.get('/dashboard', ensureAuth, async (req, res) => {
-  const lang = req.userLang;
-  const userId = req.user.id;
-  
-  try {
-    const ownedWikisResult = await pool.query(
-      'SELECT * FROM wikis WHERE owner_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC',
-      [userId]
+    if (matches) {
+        urls.push(...matches);
+    }
+
+    const tenorMediaPattern =
+        /(https?:\/\/(?:media\.tenor\.com|c\.tenor\.com)\/[^\s]+\.gif)/gi;
+    const tenorMediaMatches = content.match(tenorMediaPattern);
+    if (tenorMediaMatches) {
+        urls.push(...tenorMediaMatches);
+    }
+
+    const giphyPattern =
+        /(https?:\/\/(?:media\.giphy\.com|i\.giphy\.com)\/[^\s]+\.gif)/gi;
+    const giphyMatches = content.match(giphyPattern);
+    if (giphyMatches) {
+        urls.push(...giphyMatches);
+    }
+
+    const imgurDirectPattern =
+        /(https?:\/\/i\.imgur\.com\/[a-zA-Z0-9]+\.(?:gif|png|jpg|jpeg|webp))/gi;
+    const imgurDirectMatches = content.match(imgurDirectPattern);
+    if (imgurDirectMatches) {
+        urls.push(...imgurDirectMatches);
+    }
+
+    return urls;
+}
+
+// URLから画像情報を取得
+async function getImageInfoFromUrl(url) {
+    try {
+        const headResponse = await axios.head(url, {
+            timeout: 5000,
+            maxRedirects: 5,
+            headers: {
+                "User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            validateStatus: function (status) {
+                return status < 500;
+            },
+        });
+
+        if (headResponse.status === 429) {
+            return null;
+        }
+
+        const contentType = headResponse.headers["content-type"];
+        const contentLength = parseInt(
+            headResponse.headers["content-length"] || "0",
+        );
+
+        if (!contentType || !contentType.startsWith("image/")) {
+            return null;
+        }
+
+        return {
+            url: url,
+            name: url.split("/").pop().split("?")[0] || "image",
+            size: contentLength,
+            contentType: contentType,
+            isFromUrl: true,
+        };
+    } catch (error) {
+        return null;
+    }
+}
+
+// GIFフレーム情報を解析
+async function analyzeGifFrames(buffer) {
+    const frames = [];
+
+    try {
+        let gif;
+        try {
+            gif = await Jimp.read(buffer);
+        } catch (jimpError) {
+            console.error("Jimp読み込みエラー:", jimpError.message);
+            return [];
+        }
+
+        const frameData = gif._frames || gif.frames || [];
+
+        if (!frameData || frameData.length === 0) {
+            const { luminance, hue, r, g, b } = calculateAverageFromPixels(
+                gif.bitmap.data,
+                100,
+            );
+            return [
+                {
+                    delay: 0,
+                    luminance: luminance,
+                    hue: hue,
+                    r: r,
+                    g: g,
+                    b: b,
+                },
+            ];
+        }
+
+        if (frameData.length > 200) {
+            return [];
+        }
+
+        for (let i = 0; i < frameData.length; i++) {
+            const frame = frameData[i];
+            const pixelData = frame.bitmap ? frame.bitmap.data : frame.data;
+
+            if (!pixelData) {
+                continue;
+            }
+
+            const delay = (frame.delay || 10) * 10;
+            const { luminance, hue, r, g, b } = calculateAverageFromPixels(
+                pixelData,
+                100,
+            );
+
+            frames.push({
+                delay: delay,
+                luminance: luminance,
+                hue: hue,
+                r: r,
+                g: g,
+                b: b,
+            });
+        }
+    } catch (error) {
+        console.error("❌ GIF解析中の致命的エラー:", error.message);
+        return [];
+    }
+
+    return frames;
+}
+
+// 改善された点滅GIF検出
+function detectFlashingGif(frames) {
+    if (frames.length < 2) {
+        return { isFlashing: false, reason: "フレーム数不足または解析失敗" };
+    }
+
+    let rapidChanges = 0;
+    let maxLuminanceChange = 0;
+    let maxHueChange = 0;
+    let veryFastFrames = 0;
+    let consecutiveRapidChanges = 0;
+    let maxConsecutiveRapidChanges = 0;
+
+    for (let i = 1; i < frames.length; i++) {
+        const prev = frames[i - 1];
+        const curr = frames[i];
+
+        const luminanceChange = Math.abs(curr.luminance - prev.luminance);
+        maxLuminanceChange = Math.max(maxLuminanceChange, luminanceChange);
+
+        let hueChange = Math.abs(curr.hue - prev.hue);
+        if (hueChange > 180) hueChange = 360 - hueChange;
+        maxHueChange = Math.max(maxHueChange, hueChange);
+
+        if (curr.delay <= 2) {
+            veryFastFrames++;
+        }
+
+        if (luminanceChange > 150 && hueChange > 150) {
+            rapidChanges++;
+            consecutiveRapidChanges++;
+            maxConsecutiveRapidChanges = Math.max(
+                maxConsecutiveRapidChanges,
+                consecutiveRapidChanges,
+            );
+        } else {
+            consecutiveRapidChanges = 0;
+        }
+    }
+
+    const changeRate = rapidChanges / (frames.length - 1);
+    const fastFrameRate = veryFastFrames / frames.length;
+
+    const isFlashing =
+        changeRate > 0.6 ||
+        (changeRate > 0.4 && fastFrameRate > 0.6) ||
+        (maxLuminanceChange > 180 &&
+            maxHueChange > 180 &&
+            fastFrameRate > 0.5) ||
+        maxConsecutiveRapidChanges >= 5;
+
+    return {
+        isFlashing: isFlashing,
+        details: {
+            totalFrames: frames.length,
+            rapidChanges: rapidChanges,
+            changeRate: (changeRate * 100).toFixed(1) + "%",
+            maxLuminanceChange: Math.round(maxLuminanceChange),
+            maxHueChange: Math.round(maxHueChange),
+            veryFastFrames: veryFastFrames,
+            fastFrameRate: (fastFrameRate * 100).toFixed(1) + "%",
+            maxConsecutiveRapidChanges: maxConsecutiveRapidChanges,
+        },
+    };
+}
+
+// 危険なGIFを検出する関数
+async function checkDangerousGif(attachment) {
+    try {
+        if (
+            !attachment.contentType ||
+            !attachment.contentType.startsWith("image/")
+        ) {
+            return { isDangerous: false };
+        }
+
+        if (attachment.size > 15 * 1024 * 1024) {
+            return {
+                isDangerous: true,
+                reason: "ファイルサイズが大きすぎます",
+                details: `${(attachment.size / 1024 / 1024).toFixed(2)}MB`,
+            };
+        }
+
+        if (attachment.contentType === "image/gif") {
+            try {
+                const response = await axios.get(attachment.url, {
+                    responseType: "arraybuffer",
+                    timeout: 15000,
+                    maxContentLength: 20 * 1024 * 1024,
+                });
+
+                const buffer = Buffer.from(response.data);
+                const header = buffer.toString("ascii", 0, 6);
+
+                if (header !== "GIF87a" && header !== "GIF89a") {
+                    return {
+                        isDangerous: true,
+                        reason: "無効なGIFファイル形式",
+                    };
+                }
+
+                const width = buffer.readUInt16LE(6);
+                const height = buffer.readUInt16LE(8);
+
+                if (width > 8192 || height > 8192) {
+                    return {
+                        isDangerous: true,
+                        reason: "解像度が大きすぎます",
+                        details: `${width}x${height}`,
+                    };
+                }
+
+                const frames = await analyzeGifFrames(buffer);
+
+                if (frames.length > 500) {
+                    return {
+                        isDangerous: true,
+                        reason: "フレーム数が多すぎます",
+                        details: `${frames.length}フレーム`,
+                    };
+                }
+
+                const flashResult = detectFlashingGif(frames);
+
+                if (flashResult.isFlashing) {
+                    return {
+                        isDangerous: true,
+                        reason: "点滅GIF(フォトセンシティブ発作の危険性)",
+                        details: flashResult.details,
+                    };
+                }
+
+                if (frames.length > 50 && buffer.length / frames.length < 100) {
+                    return {
+                        isDangerous: true,
+                        reason: "異常なファイル構造(クラッシュGIF)",
+                    };
+                }
+
+            } catch (error) {
+                console.error("❌ GIF解析中のエラー:", error.message);
+                if (
+                    error.code === "ECONNABORTED" ||
+                    error.code === "ERR_BAD_REQUEST"
+                ) {
+                    return {
+                        isDangerous: true,
+                        reason: "ファイルの読み込みに失敗(破損またはサイズ過大)",
+                    };
+                }
+
+                return {
+                    isDangerous: true,
+                    reason: "GIF解析エラー(安全のため制限)",
+                };
+            }
+        }
+
+        return { isDangerous: false };
+    } catch (error) {
+        console.error("❌ GIFチェック中の外部エラー:", error);
+        return { isDangerous: false };
+    }
+}
+
+// レイドモード状態をリセットする関数
+function resetRaidMode(guildId) {
+    raidModeStatus.delete(guildId);
+    console.log(`レイドモード状態をリセットしました - Guild ID: ${guildId}`);
+}
+
+// スレッドスパム検知関数
+async function checkThreadSpam(member, guild) {
+    const userId = member.id;
+    const guildId = guild.id;
+    const now = Date.now();
+
+    const serverSettings = global.threadSpamSettings.get(guildId) || {
+        threshold: THREAD_SPAM_THRESHOLD_OPERATIONS,
+        timeWindow: THREAD_SPAM_THRESHOLD_TIME_MS,
+        timeoutDuration: THREAD_SPAM_TIMEOUT_DURATION,
+    };
+
+    if (!userThreadHistory.has(userId)) {
+        userThreadHistory.set(userId, []);
+    }
+
+    const history = userThreadHistory.get(userId);
+
+    const cleanHistory = history.filter(
+        (entry) =>
+            now - entry.timestamp < serverSettings.timeWindow &&
+            entry.guildId === guildId,
     );
-    const ownedWikis = ownedWikisResult.rows;
-    
-    const editableWikisResult = await pool.query(`
-      SELECT w.* FROM wikis w 
-      JOIN wiki_permissions wp ON w.id = wp.wiki_id 
-      WHERE wp.editor_id = $1 AND w.owner_id != $1 AND w.deleted_at IS NULL
-    `, [userId]);
-    const editableWikis = editableWikisResult.rows;
-    
-    const recentEditsResult = await pool.query(`
-      SELECT p.name as page_name, w.name as wiki_name, w.address as wiki_address, r.created_at
-      FROM revisions r
-      JOIN pages p ON r.page_id = p.id 
-      JOIN wikis w ON p.wiki_id = w.id
-      WHERE r.editor_id = $1 AND w.deleted_at IS NULL AND p.deleted_at IS NULL
-      ORDER BY r.created_at DESC LIMIT 10
-    `, [userId]);
-    const recentEdits = recentEditsResult.rows;
 
-    const body = `
-      <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > 📊 ${getText('dashboard', lang)}</div>
-      <h1>📊 ${getText('dashboard', lang)}</h1>
-      
-      <div class="row">
-        <div class="card">
-          <h3>📚 ${lang === 'ja' ? '所有Wiki' : 'Owned Wikis'}</h3>
-          ${ownedWikis.length ? ownedWikis.map(w => `
-            <div style="margin-bottom: 12px; padding: 12px; background: var(--bg-secondary); border-radius: 8px;">
-              <h4 style="margin: 0;"><a href="/${w.address}">${w.name}</a></h4>
-              <p class="muted">${w.address} • ${lang === 'ja' ? '閲覧数' : 'Views'}: ${w.views || 0}</p>
-              <a class="btn" href="/${w.address}-edit">${getText('edit', lang)}</a>
-            </div>
-          `).join('') : `<p class="muted">${lang === 'ja' ? '所有Wikiがありません。' : 'No owned wikis.'}</p>`}
-        </div>
-        
-        <div class="card">
-          <h3>✏️ ${lang === 'ja' ? '編集可能Wiki' : 'Editable Wikis'}</h3>
-          ${editableWikis.length ? editableWikis.map(w => `
-            <div style="margin-bottom: 12px; padding: 12px; background: var(--bg-secondary); border-radius: 8px;">
-              <h4 style="margin: 0;"><a href="/${w.address}">${w.name}</a></h4>
-              <p class="muted">${w.address}</p>
-              <a class="btn" href="/${w.address}-edit">${getText('edit', lang)}</a>
-            </div>
-          `).join('') : `<p class="muted">${lang === 'ja' ? '編集可能Wikiがありません。' : 'No editable wikis.'}</p>`}
-        </div>
-      </div>
+    cleanHistory.push({ timestamp: now, guildId: guildId });
+    userThreadHistory.set(userId, cleanHistory);
 
-      <div class="card">
-        <h3>🕒 ${getText('recentEdits', lang)}</h3>
-        ${recentEdits.length ? recentEdits.map(e => `
-          <div style="margin-bottom: 12px; padding: 12px; background: var(--bg-secondary); border-radius: 8px;">
-            <a href="/${e.wiki_address}/${encodeURIComponent(e.page_name)}">📄 ${e.page_name}</a> 
-            in 
-            <a href="/${e.wiki_address}">📚 ${e.wiki_name}</a>
-            <div class="muted">${new Date(e.created_at).toLocaleString(lang === 'ja' ? 'ja-JP' : 'en-US')}</div>
-          </div>
-        `).join('') : `<p class="muted">${lang === 'ja' ? '最近の編集がありません。' : 'No recent edits.'}</p>`}
-      </div>
-    `;
-    
-    res.send(renderLayout(`${getText('dashboard', lang)}`, body, null, lang, req));
-  } catch (error) {
-    console.error('Dashboard error:', error);
-    res.status(500).send(renderLayout('Error', `<div class="card"><p class="danger">⛔ エラーが発生しました</p></div>`, null, lang, req));
-  }
+    if (cleanHistory.length >= serverSettings.threshold) {
+        console.log(`スレッドスパム検知！ユーザー: ${member.user.username}`);
+
+        try {
+            await member.timeout(
+                serverSettings.timeoutDuration,
+                "スレッドスパム検知による自動タイムアウト",
+            );
+
+            let logChannel = guild.channels.cache.find(
+                (channel) =>
+                    channel.name === "nightguard-log" &&
+                    channel.type === ChannelType.GuildText,
+            );
+
+            if (!logChannel) {
+                logChannel = await guild.channels.create({
+                    name: "nightguard-log",
+                    type: ChannelType.GuildText,
+                    permissionOverwrites: [
+                        {
+                            id: guild.roles.everyone,
+                            deny: ["ViewChannel"],
+                        },
+                        {
+                            id: client.user.id,
+                            allow: ["ViewChannel", "SendMessages"],
+                        },
+                    ],
+                    reason: "スレッドスパム検知ログ用チャンネルを作成",
+                });
+            }
+
+            const timeoutMinutes = Math.ceil(
+                serverSettings.timeoutDuration / 60000,
+            );
+            await logChannel.send(
+                `🚨 **スレッドスパム検知 & 自動タイムアウト** 🚨\n` +
+                    `ユーザー: ${member.user.username} (${member.user.id})\n` +
+                    `検知内容: ${Math.floor(serverSettings.timeWindow / 1000)}秒間に${cleanHistory.length}回のスレッド操作\n` +
+                    `タイムアウト時間: ${timeoutMinutes}分\n` +
+                    `自動的にタイムアウトしました。`,
+            );
+
+            userThreadHistory.delete(userId);
+
+            return true;
+        } catch (error) {
+            console.error(`スレッドスパムタイムアウト失敗 (${userId}):`, error);
+        }
+    }
+
+    return false;
+}
+
+// グローバルでアクセスできるようにする
+global.resetRaidMode = resetRaidMode;
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildVoiceStates,
+    ],
 });
 
-// 管理者ダッシュボード
-app.get('/admin', ensureAdmin, async (req, res) => {
-  const lang = req.userLang;
-  const body = `
-    <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > ⚙️ ${getText('admin', lang)}</div>
-    <h1>⚙️ ${getText('admin', lang)} Dashboard</h1>
-    
-    <div class="row">
-      <div class="card">
-        <h3>📊 ${getText('stats', lang)}</h3>
-        <div id="admin-stats">Loading...</div>
-      </div>
-      <div class="card">
-        <h3>👥 ${getText('users', lang)} Management</h3>
-        <div class="form-group">
-          <label>Search User by Discord ID</label>
-          <input type="text" id="user-search" placeholder="Enter Discord ID">
-          <button class="btn primary" onclick="searchUser()">Search</button>
-        </div>
-        <div id="user-search-results"></div>
-      </div>
-    </div>
+client.commands = new Collection();
 
-    <div class="card">
-      <h3>📚 ${getText('wikis', lang)} Management</h3>
-      <div id="wiki-management">Loading...</div>
-    </div>
+const foldersPath = path.join(__dirname, "commands");
+const commandFolders = fs.readdirSync(foldersPath);
+const player = new Player(client);
+client.player = player;
 
-    <script>
-      fetch('/api/admin/stats').then(r => r.json()).then(data => {
-        document.getElementById('admin-stats').innerHTML = \`
-          <p><strong>Total Wikis:</strong> \${data.totalWikis}</p>
-          <p><strong>Total Pages:</strong> \${data.totalPages}</p>
-          <p><strong>Total Users:</strong> \${data.totalUsers}</p>
-          <p><strong>Total Revisions:</strong> \${data.totalRevisions}</p>
-        \`;
-      });
-
-      fetch('/api/admin/wikis').then(r => r.json()).then(data => {
-        const html = data.wikis.map(w => \`
-          <div class="card" style="margin-bottom: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <div>
-                <h4 style="margin: 0;">\${w.name}</h4>
-                <p class="muted">Address: \${w.address} • Views: \${w.views}</p>
-              </div>
-              <button class="btn danger" onclick="deleteWiki('\${w.id}', '\${w.name}')">Delete</button>
-            </div>
-          </div>
-        \`).join('');
-        document.getElementById('wiki-management').innerHTML = html || '<p class="muted">No wikis found.</p>';
-      });
-
-      async function searchUser() {
-        const userId = document.getElementById('user-search').value.trim();
-        if (!userId) return;
-        
-        const data = await fetch(\`/api/admin/user/\${userId}\`).then(r => r.json());
-        const resultsEl = document.getElementById('user-search-results');
-        
-        if (data.error) {
-          resultsEl.innerHTML = \`<p class="danger">\${data.error}</p>\`;
-          return;
+for (const folder of commandFolders) {
+    const commandsPath = path.join(foldersPath, folder);
+    const commandFiles = fs
+        .readdirSync(commandsPath)
+        .filter((file) => file.endsWith(".js"));
+    for (const file of commandFiles) {
+        const filePath = path.join(commandsPath, file);
+        const command = require(filePath);
+        if ("data" in command && "execute" in command) {
+            client.commands.set(command.data.name, command);
+        } else {
+            console.log(
+                `[あれ] ${filePath}のコマンドには、dataかexecuteのプロパティがないんだってさ。`,
+            );
         }
-        
-        const warnings = data.warnings.map(w => \`
-          <div>⚠️ \${w.reason} (by \${w.issued_by})</div>
-        \`).join('') || '<div class="muted">No warnings</div>';
-        
-        const suspension = data.suspension ? \`
-          <div class="danger">🚫 \${data.suspension.type === 'permanent' ? 'Permanently banned' : 'Temporarily suspended'}: \${data.suspension.reason}</div>
-        \` : '<div class="muted">Not suspended</div>';
-        
-        resultsEl.innerHTML = \`
-          <div class="card">
-            <h4>User ID: \${userId}</h4>
-            <p><strong>Warnings:</strong></p>
-            \${warnings}
-            <p><strong>Suspension Status:</strong></p>
-            \${suspension}
-            <div style="margin-top: 16px; display: flex; gap: 8px;">
-              <button class="btn warning" onclick="warnUser('\${userId}')">警告</button>
-              <button class="btn danger" onclick="suspendUser('\${userId}')">一時停止</button>
-              <button class="btn danger" onclick="banUser('\${userId}')">永久停止</button>
-            </div>
-          </div>
-        \`;
-      }
+    }
+}
 
-      async function warnUser(userId) {
-        const reason = prompt('Warning reason:');
-        if (!reason) return;
-        
-        const res = await fetch(\`/api/admin/user/\${userId}/warn\`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ reason })
+// 暴言リストのみ残す
+const abunai_words = [
+    "死ね",
+    "消えろ",
+    "殺す",
+    "殺して",
+    "殺してやる",
+    "障害者",
+    "ガイジ",
+    "がいじ",
+    "知的障害",
+    "きえろ",
+    "ころす",
+    "ころして",
+    "ころしてやる",
+    "しょうがいしゃ",
+    "ちてきしょうがい",
+    "!kiken",
+    "RAID BY OZEU",
+    "discord.gg/ozeu",
+    "discord.gg/ozeu-x",
+];
+
+// 危険なBotのIDリスト
+const DANGEROUS_BOT_IDS = [
+    "1363066479100170330",
+    "1286667959397515355",
+    "1371866834818826380",
+    "1321414173602746419",
+    "1349568375839264870",
+    "1352599521032540190",
+    "1378391189576876174",
+    "1336633477868683305",
+    "1352779479302410260",
+    "1379825654035648555",
+    "1386680498537107666",
+];
+
+// アプリケーション使用時の悪意あるワード
+const MALICIOUS_APP_WORDS = [
+    "死ね",
+    "殺す",
+    "殺して",
+    "消えろ",
+    "ころす",
+    "しね",
+    "きえろ",
+    "障害者",
+    "ガイジ",
+    "がいじ",
+    "知的障害",
+    "ちてきしょうがい",
+    "バカ",
+    "アホ",
+    "ばか",
+    "あほ",
+    "うざい",
+    "きもい",
+    "気持ち悪い",
+    "うんち",
+    "うんこ",
+    "クソ",
+    "くそ",
+    "ファック",
+    "fuck",
+    "shit",
+    "bitch",
+    "RAID BY OZEU",
+    "discord.gg/ozeu",
+    "discord.gg/ozeu-x",
+];
+
+// NukeBot検知のための設定
+const NUKEBOT_DETECTION_WINDOW = 2 * 60 * 1000;
+const NUKEBOT_ROLE_THRESHOLD = 10;
+const NUKEBOT_CHANNEL_THRESHOLD = 5;
+const nukeBotHistory = new Map();
+
+function hasProfanityExclusion(member, guildId) {
+    const exclusion = global.exclusionRoles?.get(guildId);
+    if (!exclusion || exclusion.profanityDetection?.size === 0) return false;
+    return member.roles.cache.some((role) =>
+        exclusion.profanityDetection.has(role.id),
+    );
+}
+
+// NukeBot検知用の操作履歴を記録する関数
+function recordBotActivity(botId, guildId, activityType) {
+    const now = Date.now();
+    const key = `${botId}-${guildId}`;
+
+    if (!nukeBotHistory.has(key)) {
+        nukeBotHistory.set(key, {
+            roleActions: [],
+            channelActions: [],
         });
-        if (res.ok) {
-          alert('Warning issued');
-          searchUser();
-        } else {
-          alert('Failed to issue warning');
-        }
-      }
+    }
 
-      async function suspendUser(userId) {
-        const reason = prompt('Suspension reason:');
-        if (!reason) return;
-        const days = prompt('Days to suspend:');
-        
-        const res = await fetch(\`/api/admin/user/\${userId}/suspend\`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ reason, days: days ? parseInt(days) : null })
+    const history = nukeBotHistory.get(key);
+    const windowStart = now - NUKEBOT_DETECTION_WINDOW;
+
+    if (activityType === "role") {
+        history.roleActions = history.roleActions.filter(
+            (timestamp) => timestamp >= windowStart,
+        );
+        history.roleActions.push(now);
+    } else if (activityType === "channel") {
+        history.channelActions = history.channelActions.filter(
+            (timestamp) => timestamp >= windowStart,
+        );
+        history.channelActions.push(now);
+    }
+
+    nukeBotHistory.set(key, history);
+    return history;
+}
+
+// NukeBot検知関数
+async function checkForNukeBot(guild, botUser, activityType) {
+    const history = recordBotActivity(botUser.id, guild.id, activityType);
+
+    const roleActionsCount = history.roleActions.length;
+    const channelActionsCount = history.channelActions.length;
+
+    console.log(
+        `NukeBot検知チェック - Bot: ${botUser.username}, ロール操作: ${roleActionsCount}, チャンネル操作: ${channelActionsCount}`,
+    );
+
+    if (
+        roleActionsCount >= NUKEBOT_ROLE_THRESHOLD ||
+        channelActionsCount >= NUKEBOT_CHANNEL_THRESHOLD
+    ) {
+        console.log(`NukeBot検知！ Bot: ${botUser.username} (${botUser.id})`);
+        await banNukeBot(guild, botUser, roleActionsCount, channelActionsCount);
+    }
+}
+
+// NukeBotをBANする関数
+async function banNukeBot(guild, botUser, roleCount, channelCount) {
+    try {
+        const member = guild.members.cache.get(botUser.id);
+        if (!member) return;
+
+        await member.ban({
+            reason: `NukeBot検知: 2分間でロール操作${roleCount}回、チャンネル操作${channelCount}回`,
         });
-        if (res.ok) {
-          alert('User suspended');
-          searchUser();
-        } else {
-          alert('Failed to suspend user');
-        }
-      }
 
-      async function banUser(userId) {
-        const reason = prompt('Ban reason:');
-        if (!reason) return;
-        if (!confirm('Permanently ban this user?')) return;
-        
-        const res = await fetch(\`/api/admin/user/\${userId}/ban\`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ reason })
-        });
-        if (res.ok) {
-          alert('User banned');
-          searchUser();
-        } else {
-          alert('Failed to ban user');
-        }
-      }
+        console.log(
+            `NukeBot ${botUser.username} (${botUser.id}) をBANしました`,
+        );
 
-      async function deleteWiki(wikiId, wikiName) {
-        if (!confirm(\`Delete wiki "\${wikiName}"?\`)) return;
-        
-        const res = await fetch(\`/api/admin/wiki/\${wikiId}\`, { method: 'DELETE' });
-        if (res.ok) {
-          alert('Wiki deleted');
-          location.reload();
-        } else {
-          alert('Failed to delete wiki');
-        }
-      }
-    </script>
-  `;
-  res.send(renderLayout(`${getText('admin', lang)} Dashboard`, body, null, lang, req));
-});
+        let logChannel = guild.channels.cache.find(
+            (channel) =>
+                channel.name === "nightguard-log" &&
+                channel.type === ChannelType.GuildText,
+        );
 
-// 管理者API
-app.get('/api/admin/stats', ensureAdmin, async (req, res) => {
-  try {
-    const wikisResult = await pool.query('SELECT COUNT(*) as count FROM wikis WHERE deleted_at IS NULL');
-    const pagesResult = await pool.query('SELECT COUNT(*) as count FROM pages WHERE deleted_at IS NULL');
-    const usersResult = await pool.query('SELECT COUNT(DISTINCT editor_id) as count FROM revisions');
-    const revisionsResult = await pool.query('SELECT COUNT(*) as count FROM revisions');
-    
-    res.json({ 
-      totalWikis: parseInt(wikisResult.rows[0].count),
-      totalPages: parseInt(pagesResult.rows[0].count),
-      totalUsers: parseInt(usersResult.rows[0].count),
-      totalRevisions: parseInt(revisionsResult.rows[0].count)
+        if (!logChannel) {
+            logChannel = await guild.channels.create({
+                name: "nightguard-log",
+                type: ChannelType.GuildText,
+                permissionOverwrites: [
+                    {
+                        id: guild.roles.everyone,
+                        deny: ["ViewChannel"],
+                    },
+                    {
+                        id: client.user.id,
+                        allow: ["ViewChannel", "SendMessages"],
+                    },
+                ],
+                reason: "NukeBot検知ログ用チャンネルを作成",
+            });
+        }
+
+        await logChannel.send(
+            `🚨 **NukeBot検知 & 自動BAN** 🚨\n` +
+                `Bot名: ${botUser.username}\n` +
+                `BotID: \`${botUser.id}\`\n` +
+                `検知理由: 2分間で異常な操作を検知\n` +
+                `- ロール操作: ${roleCount}回\n` +
+                `- チャンネル操作: ${channelCount}回\n` +
+                `自動的にBANしました。サーバーを保護しています。`,
+        );
+    } catch (error) {
+        console.error(
+            `NukeBot (${botUser.id}) のBAN中にエラーが発生しました:`,
+            error,
+        );
+    }
+}
+
+// 通常の参加者ペースを計算する関数
+function calculateNormalJoinRate(guildId) {
+    const history = joinHistory.get(guildId) || [];
+    const now = Date.now();
+    const normalPeriodStart = now - NORMAL_PERIOD_DAYS * 24 * 60 * 60 * 1000;
+
+    const normalPeriodJoins = history.filter(
+        (timestamp) => timestamp >= normalPeriodStart,
+    );
+
+    if (normalPeriodJoins.length === 0) {
+        return 0;
+    }
+
+    const hoursInPeriod = (now - normalPeriodStart) / (60 * 60 * 1000);
+    const avgJoinsPerHour = normalPeriodJoins.length / hoursInPeriod;
+    return avgJoinsPerHour * (5 / 60);
+}
+
+// レイド検知関数
+async function checkForRaid(guild) {
+    const guildId = guild.id;
+    const history = joinHistory.get(guildId) || [];
+    const now = Date.now();
+    const windowStart = now - RAID_DETECTION_WINDOW;
+
+    const recentJoins = history.filter((timestamp) => timestamp >= windowStart);
+    const recentJoinCount = recentJoins.length;
+
+    const normalRate = calculateNormalJoinRate(guildId);
+    const threshold = Math.max(
+        normalRate * RAID_THRESHOLD_MULTIPLIER,
+        MIN_RAID_MEMBERS,
+    );
+
+    if (recentJoinCount >= threshold) {
+        console.log(`レイド検知！ サーバー: ${guild.name}`);
+        await activateRaidMode(guild);
+    }
+}
+
+// レイドモード有効化関数
+async function activateRaidMode(guild) {
+    try {
+        const guildId = guild.id;
+
+        if (raidModeStatus.get(guildId)) {
+            console.log(`レイドモードは既に有効です - サーバー: ${guild.name}`);
+            return;
+        }
+
+        let raidGuardRole = guild.roles.cache.find(
+            (role) => role.name === "RaidGuard_NightGuard",
+        );
+
+        const isNewRaidMode = !raidGuardRole;
+
+        if (!raidGuardRole) {
+            raidGuardRole = await guild.roles.create({
+                name: "RaidGuard_NightGuard",
+                color: "#FF0000",
+                reason: "レイド対策用制限ロール",
+            });
+            console.log(`RaidGuard_NightGuardロールを作成しました`);
+
+            guild.channels.cache.forEach(async (channel) => {
+                if (
+                    channel.type === ChannelType.GuildText ||
+                    channel.type === ChannelType.GuildVoice
+                ) {
+                    try {
+                        await channel.permissionOverwrites.create(
+                            raidGuardRole,
+                            {
+                                SendMessages: false,
+                                AddReactions: false,
+                                SendMessagesInThreads: false,
+                                CreatePublicThreads: false,
+                                CreatePrivateThreads: false,
+                            },
+                        );
+                    } catch (error) {
+                        console.error(
+                            `チャンネル ${channel.name} の権限設定に失敗:`,
+                            error,
+                        );
+                    }
+                }
+            });
+        }
+
+        raidModeStatus.set(guildId, true);
+
+        const now = Date.now();
+        const recentJoinThreshold = now - RAID_DETECTION_WINDOW;
+
+        const recentMembers = guild.members.cache.filter(
+            (member) =>
+                member.joinedTimestamp >= recentJoinThreshold &&
+                !member.user.bot &&
+                !member.roles.cache.has(raidGuardRole.id),
+        );
+
+        for (const [, member] of recentMembers) {
+            try {
+                await member.roles.add(raidGuardRole);
+            } catch (error) {
+                console.error(
+                    `${member.user.username} へのロール与に失敗:`,
+                    error,
+                );
+            }
+        }
+
+        if (isNewRaidMode) {
+            let logChannel = guild.channels.cache.find(
+                (channel) =>
+                    channel.name === "nightguard-log" &&
+                    channel.type === ChannelType.GuildText,
+            );
+
+            if (!logChannel) {
+                logChannel = await guild.channels.create({
+                    name: "nightguard-log",
+                    type: ChannelType.GuildText,
+                    permissionOverwrites: [
+                        {
+                            id: guild.roles.everyone,
+                            deny: ["ViewChannel"],
+                        },
+                        {
+                            id: client.user.id,
+                            allow: ["ViewChannel", "SendMessages"],
+                        },
+                    ],
+                    reason: "レイド対策ログ用チャンネルを作成",
+                });
+            }
+
+            await logChannel.send(
+                `⚠️ **異常な参加ペースを検知しました！**\n` +
+                    `現在、いつもより明らかに早いスピードで新規メンバーが参加しています。\n` +
+                    `あなたのサーバーが **Raidの標的**Thな ている可能性があります。\n` +
+                    `🛡️ セキュリティ ードを自動で有効化し、**新規メンバー全員に \`RaidGuard_NightGuard\` ロール**を付与しました。\n` +
+                    `**対応方法：**\n` +
+                    `- 様子を見て問題が落ち着いたら \`/unmute_raid\` コマンドを実行してく  さい。\n` +
+                    `- それまでは新規参加者を**慎重に監視**してください。\n` +
+                    `- ❇️落ち着くことも重要です。 冷静な判断を下すためにお茶をを飲みながら警戒するのをおすすめします。\n` +
+                    `*（by NightGuard）*`,
+            );
+        }
+    } catch (error) {
+        console.error("レイドモード有効化中にエラーが発生しました:", error);
+    }
+}
+
+async function updatePresence() {
+    const serverCount = client.guilds.cache.size;
+    await client.user.setPresence({
+        activities: [
+            {
+                name: `${serverCount}個のサーバーでせっせと働いています`,
+                type: 0,
+            },
+        ],
+        status: "online",
     });
-  } catch (error) {
-    console.error('Admin stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch stats' });
-  }
-});
+}
 
-app.get('/api/admin/wikis', ensureAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT w.id, w.name, w.address, w.views, w.owner_id, w.created_at
-      FROM wikis w 
-      WHERE w.deleted_at IS NULL 
-      ORDER BY w.views DESC, w.created_at DESC
-      LIMIT 50
-    `);
-    
-    res.json({ wikis: result.rows });
-  } catch (error) {
-    console.error('Admin wikis error:', error);
-    res.status(500).json({ error: 'Failed to fetch wikis' });
-  }
-});
+client.on("ready", updatePresence);
+client.on("guildCreate", updatePresence);
+client.on("guildDelete", updatePresence);
 
-app.get('/api/admin/user/:userId', ensureAdmin, async (req, res) => {
-  const { userId } = req.params;
-  
-  try {
-    const warningsResult = await pool.query(
-      'SELECT * FROM user_warnings WHERE user_id = $1 ORDER BY created_at DESC',
-      [userId]
-    );
-    
-    const suspensionResult = await pool.query(
-      'SELECT * FROM user_suspensions WHERE user_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 1',
-      [userId]
-    );
-    
-    res.json({ 
-      warnings: warningsResult.rows, 
-      suspension: suspensionResult.rows[0] || null 
-    });
-  } catch (error) {
-    console.error('Admin user error:', error);
-    res.status(500).json({ error: 'Failed to fetch user data' });
-  }
-});
-
-app.post('/api/admin/user/:userId/warn', ensureAdmin, async (req, res) => {
-  const { userId } = req.params;
-  const { reason } = req.body;
-  
-  if (!reason) return res.status(400).json({ error: 'Reason required' });
-  
-  try {
-    await pool.query(
-      'INSERT INTO user_warnings(user_id, reason, issued_by) VALUES ($1, $2, $3)',
-      [userId, reason, req.user.id]
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Warn user error:', error);
-    res.status(500).json({ error: 'Failed to warn user' });
-  }
-});
-
-app.post('/api/admin/user/:userId/suspend', ensureAdmin, async (req, res) => {
-  const { userId } = req.params;
-  const { reason, days } = req.body;
-  
-  if (!reason) return res.status(400).json({ error: 'Reason required' });
-  
-  let expiresAt = null;
-  let type = 'permanent';
-  
-  if (days && days > 0) {
-    const expiry = new Date();
-    expiry.setDate(expiry.getDate() + days);
-    expiresAt = expiry;
-    type = 'temporary';
-  }
-  
-  try {
-    await pool.query(
-      'INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1, $2, $3, $4, $5)',
-      [userId, type, reason, req.user.id, expiresAt]
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Suspend user error:', error);
-    res.status(500).json({ error: 'Failed to suspend user' });
-  }
-});
-
-app.post('/api/admin/user/:userId/ban', ensureAdmin, async (req, res) => {
-  const { userId } = req.params;
-  const { reason } = req.body;
-  
-  if (!reason) return res.status(400).json({ error: 'Reason required' });
-  
-  try {
-    await pool.query(
-      'INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1, $2, $3, $4, $5)',
-      [userId, 'permanent', reason, req.user.id, null]
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Ban user error:', error);
-    res.status(500).json({ error: 'Failed to ban user' });
-  }
-});
-
-app.delete('/api/admin/wiki/:wikiId', ensureAdmin, async (req, res) => {
-  const { wikiId } = req.params;
-  
-  try {
-    await pool.query('UPDATE wikis SET deleted_at = NOW() WHERE id = $1', [wikiId]);
-    await pool.query('UPDATE pages SET deleted_at = NOW() WHERE wiki_id = $1', [wikiId]);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Delete wiki error:', error);
-    res.status(500).json({ error: 'Failed to delete wiki' });
-  }
-});
-
-// 画像アップロード
-const imageUpload = multer({
-  dest: uploadDir,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed'));
-    }
-  }
-});
-
-app.post('/api/upload-image', ensureAuth, imageUpload.single('image'), (req, res) => {
-  if (req.isSuspended) return res.status(403).json({ error: 'Account suspended' });
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  
-  const fileUrl = `/uploads/${req.file.filename}`;
-  res.json({ filename: req.file.filename, url: fileUrl, size: req.file.size });
-});
-
-// サーバー起動
-async function startServer() {
-  try {
+client.on("ready", async () => {
+    // 起動時にDB初期化と設定読み込みを実行
     await initDatabase();
+    await loadSettingsFromDB();
     
-    app.listen(PORT, () => {
-      console.log(`🚀 Rec Wiki running on ${BASE_URL}`);
-      console.log(`📊 PostgreSQL connected`);
-      console.log(`👑 Admin users: ${ADMIN_USERS.join(', ')}`);
-    });
-  } catch (error) {
-    console.error('❌ Failed to start server:', error);
-    process.exit(1);
-  }
+    console.log(`${client.user.tag}でログインしました!!`);
+
+    const activities = [
+        () => `${client.guilds.cache.size}個のサーバーでせっせと働いています`,
+        () => `導入は公式サイトから`,
+    ];
+
+    let index = 0;
+
+    setInterval(() => {
+        const status = activities[index % activities.length]();
+        client.user.setPresence({
+            activities: [{ name: status, type: 0 }],
+            status: "online",
+        });
+        index++;
+    }, 30000);
+});
+
+client.on(Events.GuildCreate, async (guild) => {
+    try {
+        console.log(`新しいサーバーに参加しました: ${guild.name}`);
+
+        let logChannel = guild.channels.cache.find(
+            (channel) =>
+                channel.name === "nightguard-log" &&
+                channel.type === ChannelType.GuildText,
+        );
+
+        if (!logChannel) {
+            logChannel = await guild.channels.create({
+                name: "nightguard-log",
+                type: ChannelType.GuildText,
+                permissionOverwrites: [
+                    {
+                        id: guild.roles.everyone,
+                        deny: ["ViewChannel"],
+                    },
+                    {
+                        id: client.user.id,
+                        allow: ["ViewChannel", "SendMessages"],
+                    },
+                ],
+                reason: "NightGuard初期化 - ログチャンネル作成",
+            });
+        }
+
+        let muteRole = guild.roles.cache.find(
+            (role) => role.name === "Muted_NightGuard",
+        );
+        if (!muteRole) {
+            muteRole = await guild.roles.create({
+                name: "Muted_NightGuard",
+                color: "#808080",
+                reason: "NightGuard初期化 - ミュートロール作成",
+            });
+        }
+
+        let raidGuardRole = guild.roles.cache.find(
+            (role) => role.name === "RaidGuard_NightGuard",
+        );
+        if (!raidGuardRole) {
+            raidGuardRole = await guild.roles.create({
+                name: "RaidGuard_NightGuard",
+                color: "#FF0000",
+                reason: "NightGuard初期化 - レイドガードロール作成",
+            });
+        }
+
+        let appRestrictRole = guild.roles.cache.find(
+            (role) => role.name === "AppRestrict_NightGuard",
+        );
+        if (!appRestrictRole) {
+            appRestrictRole = await guild.roles.create({
+                name: "AppRestrict_NightGuard",
+                color: "#FFA500",
+                reason: "NightGuard初期化 - アプリケーション制限ロール作成",
+            });
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        const channels = guild.channels.cache.filter(
+            (channel) =>
+                channel.type === ChannelType.GuildText ||
+                channel.type === ChannelType.GuildVoice,
+        );
+
+        for (const [, channel] of channels) {
+            try {
+                const botMember = guild.members.cache.get(client.user.id);
+                if (
+                    !channel
+                        .permissionsFor(botMember)
+                        .has(["ManageRoles", "ManageChannels"])
+                ) {
+                    continue;
+                }
+
+                await channel.permissionOverwrites.create(muteRole, {
+                    SendMessages: false,
+                    Speak: false,
+                    AddReactions: false,
+                    SendMessagesInThreads: false,
+                    CreatePublicThreads: false,
+                    CreatePrivateThreads: false,
+                });
+
+                await channel.permissionOverwrites.create(raidGuardRole, {
+                    SendMessages: false,
+                    AddReactions: false,
+                    SendMessagesInThreads: false,
+                    CreatePublicThreads: false,
+                    CreatePrivateThreads: false,
+                });
+
+                await new Promise((resolve) => setTimeout(resolve, 200));
+            } catch (error) {
+                // エラーログ省略
+            }
+        }
+
+        await logChannel.send({
+            content:
+                `\n` +
+                `Botの導入ありがとうございます、NightGuardのロールの順位をなるべく高くして、\n` +
+                `その下にRaidGuard_NightGuardロール、Muted_NightGuardロールを設置してください。\n` +
+                `現在はおそらく権限の問題でチャンネルにロールが付いてないと思うので、上を行ってから/resetupコマンドの実行をお願いします`,
+            files: ["https://i.imgur.com/hoaV8id.gif"],
+        });
+
+        console.log(`${guild.name} への初期化が完了しました`);
+    } catch (error) {
+        console.error(
+            "サーバー参加時の初期化処理でエラーが発生しました:",
+            error,
+        );
+    }
+});
+
+const COMMAND_COOLDOWN_TIME = 15000;
+const commandCooldowns = new Map();
+
+client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isChatInputCommand()) {
+        const command = interaction.client.commands.get(
+            interaction.commandName,
+        );
+        if (!command) {
+            return;
+        }
+
+        const userId = interaction.user.id;
+        const commandName = interaction.commandName;
+        const now = Date.now();
+
+        if (!commandCooldowns.has(userId)) {
+            commandCooldowns.set(userId, {});
+        }
+
+        const userCooldowns = commandCooldowns.get(userId);
+        const lastExecuted = userCooldowns[commandName] || 0;
+        const timeDiff = now - lastExecuted;
+
+        if (timeDiff < COMMAND_COOLDOWN_TIME) {
+            const remainingTime = Math.ceil(
+                (COMMAND_COOLDOWN_TIME - timeDiff) / 1000,
+            );
+            await interaction.reply({
+                content: `⏰ コマンドのクールダウン中です。あと ${remainingTime} 秒お待ちください。`,
+                ephemeral: true,
+            });
+            return;
+        }
+
+        userCooldowns[commandName] = now;
+        commandCooldowns.set(userId, userCooldowns);
+
+        try {
+            await command.execute(interaction);
+        } catch (error) {
+            console.error(error);
+            const replyContent = {
+                content: "コマンド実行してるときにエラー出たんだってさ。",
+                ephemeral: true,
+            };
+            if (interaction.replied || interaction.deferred) {
+                await interaction.followUp(replyContent);
+            } else {
+                await interaction.reply(replyContent);
+            }
+        }
+    } else if (interaction.isButton() || interaction.isStringSelectMenu()) {
+        if (
+            interaction.customId === "start_auth" ||
+            interaction.customId === "auth_answer"
+        ) {
+            await authPanel.handleAuthInteraction(interaction);
+        }
+    }
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+    const guildId = member.guild.id;
+    const now = Date.now();
+
+    if (!joinHistory.has(guildId)) {
+        joinHistory.set(guildId, []);
+    }
+
+    const history = joinHistory.get(guildId);
+    history.push(now);
+
+    const sevenDaysAgo = now - NORMAL_PERIOD_DAYS * 24 * 60 * 60 * 1000;
+    const cleanHistory = history.filter(
+        (timestamp) => timestamp >= sevenDaysAgo,
+    );
+    joinHistory.set(guildId, cleanHistory);
+
+    if (member.user.bot) {
+        if (DANGEROUS_BOT_IDS.includes(member.user.id)) {
+            try {
+                await member.ban({ reason: "危険なBotのため自動BAN" });
+
+                let logChannel = member.guild.channels.cache.find(
+                    (channel) =>
+                        channel.name === "nightguard-log" &&
+                        channel.type === ChannelType.GuildText,
+                );
+
+                if (!logChannel) {
+                    logChannel = await member.guild.channels.create({
+                        name: "nightguard-log",
+                        type: ChannelType.GuildText,
+                        permissionOverwrites: [
+                            {
+                                id: member.guild.roles.everyone,
+                                deny: ["ViewChannel"],
+                            },
+                            {
+                                id: client.user.id,
+                                allow: ["ViewChannel", "SendMessages"],
+                            },
+                        ],
+                        reason: "危険なBotのログ用チャンネルを作成",
+                    });
+                }
+
+                await logChannel.send(
+                    `:rotating_light: **危険なBot検知 & BAN** :rotating_light:\n` +
+                        `Botの名前: ${member.user.tag}\n` +
+                        `BotのID: \`${member.user.id}\`\n` +
+                        `理由: 危険なBotリストに含まれていたため、自動的にBANしました。`,
+                );
+            } catch (error) {
+                console.error(
+                    `危険なBot (${member.user.id}) のBANまたはログ送信中にエラーが発生しました:`,
+                    error,
+                );
+            }
+        }
+    } else {
+        await checkForRaid(member.guild);
+
+        const raidGuardRole = member.guild.roles.cache.find(
+            (role) => role.name === "RaidGuard_NightGuard",
+        );
+        const isRaidMode = raidModeStatus.get(guildId);
+
+        if (raidGuardRole && isRaidMode) {
+            try {
+                await member.roles.add(raidGuardRole);
+            } catch (error) {
+                console.error(
+                    `新規参加者へのRaidGuard_NightGuardロール付与に失敗:`,
+                    error,
+                );
+            }
+        }
+    }
+});
+
+client.on(Events.GuildRoleCreate, async (role) => {
+    try {
+        const auditLogs = await role.guild.fetchAuditLogs({
+            type: 30, // ROLE_CREATE
+            limit: 1,
+        });
+
+        const logEntry = auditLogs.entries.first();
+        if (logEntry && logEntry.executor && logEntry.executor.bot) {
+            await checkForNukeBot(role.guild, logEntry.executor, "role");
+        }
+    } catch (error) {
+        console.error("ロール作成監視中にエラーが発生しました:", error);
+    }
+});
+
+client.on(Events.GuildRoleDelete, async (role) => {
+    try {
+        const auditLogs = await role.guild.fetchAuditLogs({
+            type: 32, // ROLE_DELETE
+            limit: 1,
+        });
+
+        const logEntry = auditLogs.entries.first();
+        if (logEntry && logEntry.executor && logEntry.executor.bot) {
+            await checkForNukeBot(role.guild, logEntry.executor, "role");
+        }
+    } catch (error) {
+        console.error("ロール削除監視中にエラーが発生しました:", error);
+    }
+});
+
+client.on(Events.ChannelCreate, async (channel) => {
+    try {
+        const auditLogs = await channel.guild.fetchAuditLogs({
+            type: 10, // CHANNEL_CREATE
+            limit: 1,
+        });
+
+        const logEntry = auditLogs.entries.first();
+        if (logEntry && logEntry.executor && logEntry.executor.bot) {
+            await checkForNukeBot(channel.guild, logEntry.executor, "channel");
+        }
+    } catch (error) {
+        console.error("チャンネル作成監視中にエラーが発生しました:", error);
+    }
+
+    if (
+        channel.type === ChannelType.GuildText ||
+        channel.type === ChannelType.GuildVoice
+    ) {
+        const muteRole = channel.guild.roles.cache.find(
+            (role) => role.name === "Muted_NightGuard",
+        );
+
+        if (muteRole) {
+            try {
+                await channel.permissionOverwrites.create(muteRole, {
+                    SendMessages: false,
+                    Speak: false,
+                    AddReactions: false,
+                    SendMessagesInThreads: false,
+                    CreatePublicThreads: false,
+                });
+            } catch (error) {
+                console.error(
+                    `チャンネル ${channel.name} の権限設定に失敗:`,
+                    error,
+                );
+            }
+        }
+
+        const raidGuardRole = channel.guild.roles.cache.find(
+            (role) => role.name === "RaidGuard_NightGuard",
+        );
+
+        if (raidGuardRole) {
+            try {
+                await channel.permissionOverwrites.create(raidGuardRole, {
+                    SendMessages: false,
+                    AddReactions: false,
+                    SendMessagesInThreads: false,
+                    CreatePublicThreads: false,
+                    CreatePrivateThreads: false,
+                });
+            } catch (error) {
+                console.error(
+                    `チャンネル ${channel.name} のRaidGuard_NightGuard権限設定に失敗:`,
+                    error,
+                );
+            }
+        }
+
+        const appRestrictRole = channel.guild.roles.cache.find(
+            (role) => role.name === "AppRestrict_NightGuard",
+        );
+
+        if (appRestrictRole) {
+            try {
+                await channel.permissionOverwrites.create(appRestrictRole, {
+                    UseApplicationCommands: false,
+                });
+            } catch (error) {
+                console.error(
+                    `チャンネル ${channel.name} のAppRestrict_NightGuard権限設定に失敗:`,
+                    error,
+                );
+            }
+        }
+    }
+});
+
+client.on(Events.ChannelDelete, async (channel) => {
+    try {
+        const auditLogs = await channel.guild.fetchAuditLogs({
+            type: 12, // CHANNEL_DELETE
+            limit: 1,
+        });
+
+        const logEntry = auditLogs.entries.first();
+        if (logEntry && logEntry.executor && logEntry.executor.bot) {
+            await checkForNukeBot(channel.guild, logEntry.executor, "channel");
+        }
+    } catch (error) {
+        console.error("チャンネル削除監視中にエラーが発生しました:", error);
+    }
+});
+
+client.on(Events.ThreadCreate, async (thread) => {
+    if (!thread.ownerId) return;
+    const member = thread.guild.members.cache.get(thread.ownerId);
+    if (!member || member.user.bot) return;
+
+    const guildId = thread.guild.id;
+    const exclusion = global.exclusionRoles?.get(guildId);
+
+    if (exclusion && exclusion.threadSpam?.size > 0) {
+        const hasExclusionRole = member.roles.cache.some((role) =>
+            exclusion.threadSpam.has(role.id),
+        );
+        if (hasExclusionRole) {
+            return;
+        }
+    }
+
+    await checkThreadSpam(member, thread.guild);
+});
+
+client.on(Events.ThreadUpdate, async (oldThread, newThread) => {
+    if (!newThread.ownerId) return;
+    const member = newThread.guild.members.cache.get(newThread.ownerId);
+    if (!member || member.user.bot) return;
+
+    if (
+        oldThread.name !== newThread.name ||
+        oldThread.archived !== newThread.archived ||
+        oldThread.locked !== newThread.locked
+    ) {
+        const guildId = newThread.guild.id;
+        const exclusion = global.exclusionRoles?.get(guildId);
+
+        if (exclusion && exclusion.threadSpam?.size > 0) {
+            const hasExclusionRole = member.roles.cache.some((role) =>
+                exclusion.threadSpam.has(role.id),
+            );
+            if (hasExclusionRole) {
+                return;
+            }
+        }
+
+        await checkThreadSpam(member, newThread.guild);
+    }
+});
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+client.on("messageCreate", async (msg) => {
+    if (msg.author.bot) return;
+
+    const gifSettings = loadGifDetectorSettings();
+    const guildId = msg.guild?.id;
+
+    if (guildId && gifSettings[guildId]?.enabled) {
+        const imagesToCheck = [];
+
+        if (msg.attachments.size > 0) {
+            msg.attachments.forEach((att) => {
+                imagesToCheck.push(att);
+            });
+        }
+
+        if (msg.content) {
+            const urls = extractImageUrlsFromMessage(msg.content);
+            if (urls.length > 0) {
+                for (const url of urls) {
+                    const imageInfo = await getImageInfoFromUrl(url);
+                    if (imageInfo) {
+                        imagesToCheck.push(imageInfo);
+                    }
+                }
+            }
+        }
+
+        for (const attachment of imagesToCheck) {
+            const result = await checkDangerousGif(attachment);
+
+            if (result.isDangerous) {
+                try {
+                    await msg.delete();
+
+                    let muteRole = msg.guild.roles.cache.find(
+                        (role) => role.name === "Muted_NightGuard",
+                    );
+
+                    if (!muteRole) {
+                        muteRole = await msg.guild.roles.create({
+                            name: "Muted_NightGuard",
+                            color: "#808080",
+                            reason: "危険なGIF検出用ミュートロール",
+                        });
+
+                        msg.guild.channels.cache.forEach(async (channel) => {
+                            if (
+                                channel.type === ChannelType.GuildText ||
+                                channel.type === ChannelType.GuildVoice
+                            ) {
+                                try {
+                                    await channel.permissionOverwrites.create(
+                                        muteRole,
+                                        {
+                                            SendMessages: false,
+                                            Speak: false,
+                                            AddReactions: false,
+                                            SendMessagesInThreads: false,
+                                            CreatePublicThreads: false,
+                                            CreatePrivateThreads: false,
+                                        },
+                                    );
+                                } catch (error) {
+                                    console.error(
+                                        `チャンネル ${channel.name} の権限設定に失敗:`,
+                                        error,
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    const member = msg.guild.members.cache.get(msg.author.id);
+                    if (member) {
+                        await member.roles.add(muteRole);
+
+                        setTimeout(async () => {
+                            try {
+                                await member.roles.remove(muteRole);
+                            } catch (error) {
+                                console.error("ミュート解除エラー:", error);
+                            }
+                        }, 5000);
+                    }
+
+                    let detailsText = "";
+                    if (result.details) {
+                        if (typeof result.details === "string") {
+                            detailsText = `詳細: ${result.details}`;
+                        } else if (typeof result.details === "object") {
+                            detailsText =
+                                `詳細情報:\n` +
+                                `  - 総フレーム数: ${result.details.totalFrames}\n` +
+                                `  - 急激な変化: ${result.details.rapidChanges}回 (${result.details.changeRate})\n` +
+                                `  - 最大輝度変化: ${result.details.maxLuminanceChange}\n` +
+                                `  - 最大色相変化: ${result.details.maxHueChange}度\n` +
+                                `  - 高速フレーム: ${result.details.veryFastFrames}個 (${result.details.fastFrameRate})`;
+                        }
+                    }
+
+                    const warning = await msg.channel.send(
+                        `🚨 ${msg.author} **危険なGIF/画像を検出しました** 🚨\n` +
+                            `**検出理由**: ${result.reason}\n` +
+                            `${attachment.isFromUrl ? "URL" : "ファイル"}: \`${attachment.name}\`\n` +
+                            `サイズ: ${(attachment.size / 1024).toFixed(2)}KB\n` +
+                            (detailsText ? `${detailsText}\n` : "") +
+                            `\n⚠️ メッセージを削除し、5秒間のミュートを適用しました。`,
+                    );
+
+                    setTimeout(() => warning.delete().catch(() => {}), 15000);
+
+                    let logChannel = msg.guild.channels.cache.find(
+                        (channel) =>
+                            channel.name === "nightguard-log" &&
+                            channel.type === ChannelType.GuildText,
+                    );
+
+                    if (logChannel) {
+                        await logChannel.send(
+                            `🚨 **危険なGIF/画像検出** 🚨\n` +
+                                `ユーザー: ${msg.author.tag} (${msg.author.id})\n` +
+                                `チャンネル: ${msg.channel.name}\n` +
+                                `${attachment.isFromUrl ? "URL" : "ファイル"}: \`${attachment.name}\`\n` +
+                                `サイズ: ${(attachment.size / 1024).toFixed(2)}KB\n` +
+                                `検出理由: ${result.reason}\n` +
+                                (detailsText ? `${detailsText}\n` : "") +
+                                `処理: メッセージ削除 + 5秒間ミュート`,
+                        );
+                    }
+
+                    break;
+                } catch (error) {
+                    console.error("危険なGIF処理中のエラー:", error);
+                }
+            }
+        }
+    }
+
+    if (msg.reference && msg.mentions.has(client.user)) {
+        if (
+            msg.content.includes("ファクトチェック") ||
+            msg.content.includes("factcheck")
+        ) {
+            try {
+                const repliedMessage = await msg.channel.messages.fetch(
+                    msg.reference.messageId,
+                );
+
+                if (
+                    !repliedMessage.content ||
+                    repliedMessage.content.trim().length === 0
+                ) {
+                    await msg.reply(
+                        "ファクトチェックできるテキストがありません。",
+                    );
+                    return;
+                }
+
+                const processingMessage =
+                    await msg.reply("🔎 ファクトチェック中...");
+
+                const model = genAI.getGenerativeModel({
+                    model: "gemini-1.5-flash",
+                });
+                const result = await model.generateContent([
+                    "以下の文が事実かどうかファクトチェックしてください。簡潔に解説も添えてください。",
+                    repliedMessage.content,
+                ]);
+                const response = await result.response;
+                const text = response.text();
+
+                await processingMessage.edit(
+                    `🔎 **ファクトチェック結果:**\n${text}`,
+                );
+
+                return;
+            } catch (error) {
+                console.error("FactCheck Error:", error);
+                if (error.code === 10008) {
+                    await msg.reply(
+                        "リプライされたメッセージが見つかりません。メッセージが削除されているか、古すぎる可能性があります。",
+                    );
+                } else {
+                    await msg.reply(
+                        "エラーが発生しました。もう一度お試しください。",
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    const exclusion = global.exclusionRoles?.get(guildId);
+
+    if (exclusion && exclusion.spam?.size > 0) {
+        const member = msg.guild.members.cache.get(msg.author.id);
+        if (member) {
+            const hasExclusionRole = member.roles.cache.some((role) =>
+                exclusion.spam.has(role.id),
+            );
+            if (hasExclusionRole) {
+                await processNonSpamMessage(msg);
+                return;
+            }
+        }
+    }
+
+    const userId = msg.author.id;
+    const now = Date.now();
+
+    if (!userMessageHistory.has(userId)) {
+        userMessageHistory.set(userId, []);
+    }
+
+    const history = userMessageHistory.get(userId);
+    const cleanHistory = history.filter(
+        (entry) => now - entry.timestamp < SPAM_THRESHOLD_TIME_MS,
+    );
+
+    let similarCount = 1;
+
+    for (const entry of cleanHistory) {
+        const similarity = stringSimilarity.compareTwoStrings(
+            msg.content,
+            entry.content,
+        );
+        if (similarity >= SIMILARITY_THRESHOLD) {
+            similarCount++;
+        }
+    }
+
+    cleanHistory.push({ content: msg.content, timestamp: now });
+    userMessageHistory.set(userId, cleanHistory);
+
+    if (similarCount >= SPAM_THRESHOLD_MESSAGES) {
+        console.log(
+            `スパム検知！ユーザー: ${msg.author.username}, 類似メッセージ数: ${similarCount}`,
+        );
+
+        try {
+            await msg.delete();
+
+            let muteRole = msg.guild.roles.cache.find(
+                (role) => role.name === "Muted_NightGuard",
+            );
+
+            if (!muteRole) {
+                muteRole = await msg.guild.roles.create({
+                    name: "Muted_NightGuard",
+                    color: "#808080",
+                    reason: "スパム対策用ミュートロール",
+                });
+
+                msg.guild.channels.cache.forEach(async (channel) => {
+                    if (
+                        channel.type === ChannelType.GuildText ||
+                        channel.type === ChannelType.GuildVoice
+                    ) {
+                        try {
+                            await channel.permissionOverwrites.create(
+                                muteRole,
+                                {
+                                    SendMessages: false,
+                                    Speak: false,
+                                    AddReactions: false,
+                                    SendMessagesInThreads: false,
+                                    CreatePublicThreads: false,
+                                    CreatePrivateThreads: false,
+                                },
+                            );
+                        } catch (error) {
+                            console.error(
+                                `チャンネル ${channel.name} の権限設定に失敗:`,
+                                error,
+                            );
+                        }
+                    }
+                });
+            }
+
+            const member = msg.guild.members.cache.get(msg.author.id);
+            if (member && !member.roles.cache.has(muteRole.id)) {
+                await member.roles.add(muteRole);
+            }
+
+            const warn = await msg.channel.send(
+                `${msg.author} 類似メッセージの連投を検知しました（${similarCount}件）\n` +
+                    `自動的にミュートロールが付与されました。管理者にお問い合わせください。`,
+            );
+            setTimeout(() => warn.delete().catch(() => {}), 10000);
+
+            return;
+        } catch (err) {
+            console.error("スパム処理失敗:", err);
+        }
+    }
+
+    await handleNgWords(msg, false);
+    await processNonSpamMessage(msg);
+});
+
+let appRestrictionEnabled = false;
+global.appRestrictionEnabled = false;
+
+client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isCommand()) {
+        const user = interaction.user;
+        const guild = interaction.guild;
+
+        if (!guild) return;
+
+        if (interaction.applicationId === client.user.id) {
+            return;
+        }
+
+        if (global.appRestrictionEnabled) {
+            try {
+                let restrictRole = guild.roles.cache.find(
+                    (role) => role.name === "AppRestrict_NightGuard",
+                );
+
+                if (!restrictRole) {
+                    restrictRole = await guild.roles.create({
+                        name: "AppRestrict_NightGuard",
+                        color: "#FFA500",
+                        reason: "アプリケーション使用制限ロール",
+                    });
+
+                    guild.channels.cache.forEach(async (channel) => {
+                        if (
+                            channel.type === ChannelType.GuildText ||
+                            channel.type === ChannelType.GuildVoice
+                        ) {
+                            try {
+                                await channel.permissionOverwrites.create(
+                                    restrictRole,
+                                    {
+                                        UseApplicationCommands: false,
+                                        UseSlashCommands: false,
+                                    },
+                                );
+                            } catch (error) {
+                                console.error(
+                                    `チャンネル ${channel.name} のアプリケーション制限権限設定に失敗:`,
+                                    error,
+                                );
+                            }
+                        }
+                    });
+                }
+
+                const member = guild.members.cache.get(user.id);
+                if (member && !member.roles.cache.has(restrictRole.id)) {
+                    await member.roles.add(restrictRole);
+
+                    let logChannel = guild.channels.cache.find(
+                        (channel) =>
+                            channel.name === "nightguard-log" &&
+                            channel.type === ChannelType.GuildText,
+                    );
+
+                    if (logChannel) {
+                        await logChannel.send(
+                            `🚨 **アプリケーション使用制限**\n` +
+                                `ユーザー: ${user.username} (${user.id})\n` +
+                                `コマンド: ${interaction.commandName || "unknown"}\n` +
+                                `アプリケーション使用制限が有効なため、AppRestrict_NightGuardロールを付与しました。`,
+                        );
+                    }
+                }
+
+                if (!interaction.replied && !interaction.deferred) {
+                    await interaction.reply({
+                        content:
+                            "⚠️ 現在、外部アプリケーションの使用が制限されています。管理者にお問い合わせください。",
+                        ephemeral: true,
+                    });
+                }
+                return;
+            } catch (error) {
+                console.error(
+                    "アプリケーション制限ロール付与中にエラーが発生しました:",
+                    error,
+                );
+            }
+        }
+
+        let contentToCheck = "";
+
+        if (interaction.commandName) {
+            contentToCheck += interaction.commandName + " ";
+        }
+
+        if (interaction.options && interaction.options.data) {
+            for (const option of interaction.options.data) {
+                if (option.value && typeof option.value === "string") {
+                    contentToCheck += option.value + " ";
+                }
+            }
+        }
+
+        const containsMaliciousWord = MALICIOUS_APP_WORDS.some((word) =>
+            contentToCheck.toLowerCase().includes(word.toLowerCase()),
+        );
+
+        if (containsMaliciousWord) {
+            try {
+                let restrictRole = guild.roles.cache.find(
+                    (role) => role.name === "AppRestrict_NightGuard",
+                );
+
+                if (!restrictRole) {
+                    restrictRole = await guild.roles.create({
+                        name: "AppRestrict_NightGuard",
+                        color: "#FFA500",
+                        reason: "アプリケーション使用制限ロール",
+                    });
+                }
+
+                const member = guild.members.cache.get(user.id);
+                if (member && !member.roles.cache.has(restrictRole.id)) {
+                    await member.roles.add(restrictRole);
+
+                    let logChannel = guild.channels.cache.find(
+                        (channel) =>
+                            channel.name === "nightguard-log" &&
+                            channel.type === ChannelType.GuildText,
+                    );
+
+                    if (logChannel) {
+                        await logChannel.send(
+                            `🚨 **アプリケーション使用時の悪意あるワード検知**\n` +
+                                `ユーザー: ${user.username} (${user.id})\n` +
+                                `検知内容: "${contentToCheck}"\n` +
+                                `AppRestrict_NightGuardロールを付与しました。`,
+                        );
+                    }
+                }
+
+                if (!interaction.replied && !interaction.deferred) {
+                    await interaction.reply({
+                        content:
+                            "⚠️ 不適切な内容が検出されました。アプリケーション使用制限ロールが付与されました。",
+                        ephemeral: true,
+                    });
+                }
+            } catch (error) {
+                console.error(
+                    "アプリケーション制限ロール付与中にエラーが発生しました:",
+                    error,
+                );
+            }
+        }
+    }
+});
+
+async function handleNgWords(msg, isEdit = false) {
+    const guildId = msg.guild?.id;
+    if (!guildId || !ngWordsData[guildId]) return;
+
+    const settings = ngWordsData[guildId];
+    if (!settings.checkEdits && isEdit) return;
+
+    const member = msg.guild.members.cache.get(msg.author.id);
+    if (!member) return;
+
+    if (hasProfanityExclusion(member, guildId)) {
+        return;
+    }
+
+    if (settings.exceptionRoles?.some((rid) => member.roles.cache.has(rid)))
+        return;
+
+    const text = settings.caseSensitive
+        ? msg.content
+        : msg.content.toLowerCase();
+    const words = settings.caseSensitive
+        ? settings.words
+        : settings.words.map((w) => w.toLowerCase());
+
+    const hit = words.find((w) => text.includes(w));
+    if (!hit) return;
+
+    try {
+        await msg.delete();
+
+        if (settings.sendDM) {
+            await msg.author.send(
+                `⚠️ サーバー「${msg.guild.name}」でNGワード "${hit}" が検出されました。`,
+            );
+        }
+
+        switch (settings.punishment) {
+            case 0:
+            case 1:
+                break;
+            case 2:
+                await member.timeout(60_000, "NGワード違反");
+                break;
+            case 3:
+                await member.timeout(5 * 60_000, "NGワード違反");
+                break;
+            case 4:
+                await member.timeout(10 * 60_000, "NGワード違反");
+                break;
+            case 5:
+                await member.timeout(30 * 60_000, "NGワード違反");
+                break;
+            case 6:
+                await member.timeout(60 * 60_000, "NGワード違反");
+                break;
+            case 7:
+                await member.timeout(24 * 60 * 60_000, "NGワード違反");
+                break;
+            case 8:
+                await member.kick("NGワード違反");
+                break;
+            case 9:
+                await member.ban({ reason: "NGワード違反" });
+                break;
+        }
+
+        const logChannel = msg.guild.channels.cache.find(
+            (c) => c.name === "nightguard-log" && c.isTextBased(),
+        );
+        if (logChannel) {
+            await logChannel.send(
+                `🚨 **NGワード検知** 🚨\n` +
+                    `ユーザー: ${msg.author.tag} (${msg.author.id})\n` +
+                    `ワード: "${hit}"\n` +
+                    `処罰: ${settings.punishment}`,
+            );
+        }
+    } catch (err) {
+        console.error("NGワード処理エラー:", err);
+    }
 }
 
-startServer();
+async function processNonSpamMessage(msg) {
+    const messageContentLower = msg.content.toLowerCase();
+    const containsAnyWord = (wordList) =>
+        wordList.some((word) =>
+            messageContentLower.includes(word.toLowerCase()),
+        );
+    const guildId = msg.guild?.id;
+
+    if (msg.content === "!ping") {
+        msg.reply("Botは応答してるよ!");
+    } else if (msg.content.startsWith("!unmute")) {
+        if (!msg.member.permissions.has("MANAGE_ROLES")) {
+            msg.reply("このコマンドを使用する権限がありません。");
+            return;
+        }
+
+        const mentionedUser = msg.mentions.users.first();
+        if (!mentionedUser) {
+            msg.reply(
+                "ミュートを解除するユーザーをメンションしてください。\n使用法: `!unmute @ユーザー名`",
+            );
+            return;
+        }
+
+        const member = msg.guild.members.cache.get(mentionedUser.id);
+        const muteRole = msg.guild.roles.cache.find(
+            (role) => role.name === "Muted_NightGuard",
+        );
+
+        if (!member) {
+            msg.reply("指定されたユーザーがサーバーに見つかりません。");
+            return;
+        }
+
+        if (!muteRole) {
+            msg.reply("Muted_NightGuardロールが見つかりません。");
+            return;
+        }
+
+        if (!member.roles.cache.has(muteRole.id)) {
+            msg.reply("指定されたユーザーはミュートされていません。");
+            return;
+        }
+
+        try {
+            await member.roles.remove(muteRole);
+            msg.reply(`${mentionedUser.username} のミュートを解除しました。`);
+        } catch (error) {
+            console.error("ミュート解除失敗:", error);
+            msg.reply("ミュートの解除に失敗しました。");
+        }
+    } else if (containsAnyWord(abunai_words)) {
+        if (!guildId || !global.insultSettings[guildId]?.enabled) {
+            return;
+        }
+
+        const member = msg.guild.members.cache.get(msg.author.id);
+
+        if (hasProfanityExclusion(member, msg.guild.id)) {
+            return;
+        }
+
+        try {
+            await msg.reply(
+                `危険発言か暴言を検知しました。誠実な会話をしましょう`,
+            );
+            setTimeout(() => {
+                msg.delete().catch((err) =>
+                    console.error("元のメッセージの削除に失敗しました:", err),
+                );
+            }, 100);
+        } catch (error) {
+            console.error(
+                "危険発言を含むメッセージの処理中にエラーが発生しました:",
+                error,
+            );
+        }
+    }
+}
+
+if (!PORT) {
+    console.error("[ERROR] RenderのPORTが定義されていません！");
+    process.exit(1);
+}
+
+app.get("/", (req, res) => {
+    res.send("NightGuardBot Web Server 起動中！");
+});
+
+client.on("messageCreate", async (msg) => {
+    if (msg.author.bot) return;
+    await handleNgWords(msg, false);
+});
+
+client.on("messageUpdate", async (oldMsg, newMsg) => {
+    if (newMsg.partial || newMsg.author?.bot) return;
+    await handleNgWords(newMsg, true);
+});
+
+client
+    .login(token)
+    .then(() => {
+        if (!PORT) {
+            console.error("[ERROR] RenderのPORTが定義されていません！");
+            process.exit(1);
+        }
+
+        console.log("[CHECK] app.listen 実行直前");
+
+        app.listen(PORT, () => {
+            console.log(`[CHECK] ✅ HTTP server running on port ${PORT}`);
+        });
+    })
+    .catch((error) => {
+        console.error("[ERROR] Discordクライアントのログインに失敗:", error);
+        process.exit(1);
+    });
