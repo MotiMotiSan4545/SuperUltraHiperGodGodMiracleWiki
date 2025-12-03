@@ -1607,10 +1607,12 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
   }
 
   const now = new Date().toISOString();
-  const res = await pool.query(
+  const dbRes = await pool.query(
     'INSERT INTO wikis(name, address, favicon, owner_id, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
     [wname, slug, faviconPath, req.user.id, now]
   );
+
+  const wikiId = dbRes.rows[0].id;
   
   // create default home page
   const welcomeText = lang === 'ja' ? 
