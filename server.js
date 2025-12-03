@@ -1335,10 +1335,10 @@ app.get('/api/wikis', async (req, res) => {
     LEFT JOIN wiki_settings ws ON w.id = ws.wiki_id
     WHERE w.deleted_at IS NULL AND (ws.is_searchable = 1 OR ws.is_searchable IS NULL)
     ORDER BY w.views DESC, w.created_at DESC 
-    LIMIT $1 (¥156) OFFSET <span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>
+    LIMIT $1 OFFSET $2
   `, [limit, skip]);
   res.json({ wikis: result.rows, count: result.rows.length });
-}); 
+});
 
 // --- Home ---
 app.get('/', (req, res) => {
