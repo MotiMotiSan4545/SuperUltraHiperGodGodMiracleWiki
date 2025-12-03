@@ -2125,7 +2125,7 @@ app.get('/:address/:page/edit', ensureCanEdit, (req, res) => {
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
 
   const pg = pageByWikiAndName(wiki.id, page);
-  const content = pg ? pg.content : '';
+  const content = pg ? (pg.content || '') : '';
 
   const body = `
     <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > <a href="/${wiki.address}">📚 ${wiki.name}</a> > <a href="/${wiki.address}/${encodeURIComponent(page)}">📄 ${page}</a> > ✏️ ${getText('edit', lang)}</div>
@@ -2279,7 +2279,7 @@ app.get('/:address/:page', (req, res) => {
     console.warn('views update failed', e.message);
   }
 
-  const html = sanitize(md.render(pg.content));
+  const html = sanitize(md.render(pg.content || ''));
   const isSuspended = !!req.isSuspended;
   const disabledClass = isSuspended ? 'disabled' : '';
   const body = `
