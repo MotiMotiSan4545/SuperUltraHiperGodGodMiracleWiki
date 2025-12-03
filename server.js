@@ -1242,15 +1242,15 @@ app.get('/api/admin/wikis', ensureAdmin, async (req, res) => {
   res.json({ wikis: result.rows });
 });
 
-app.get('/api/admin/activities', ensureAdmin, (req, res) => {
-  const activities = db.prepare(`
+app.get('/api/admin/activities', ensureAdmin, async (req, res) => { // Added async
+  const result = await pool.query(`
     SELECT 'revision' as type, editor_id as user_id, 'Edited page' as details, created_at
     FROM revisions
     ORDER BY created_at DESC
     LIMIT 20
-  `).all();
+  `);
   
-  res.json({ activities });
+  res.json({ activities: result.rows });
 });
 
 app.get('/api/admin/user/:userId', ensureAdmin, async (req, res) => {
@@ -1412,31 +1412,33 @@ app.get('/', (req, res) => {
 });
 
 // --- User Dashboard ---
-app.get('/dashboard', ensureAuth, (req, res) => {
+app.get('/dashboard', ensureAuth, async (req, res) => { // Added async
   const lang = req.userLang;
   const userId = req.user.id;
   const isSuspended = !!req.isSuspended;
   const disabledClass = isSuspended ? 'disabled' : '';
   
-  // Get user's wikis (owned)
-  const ownedWikis = db.prepare('SELECT * FROM wikis WHERE owner_id = ? AND deleted_at IS NULL ORDER BY created_at DESC').all(userId);
+  // Use pool.query, change ? to $1, and access .rows
+  const ownedRes = await pool.query('SELECT * FROM wikis WHERE owner_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC', [userId]);
+  const ownedWikis = ownedRes.rows;
   
-  // Get wikis user has permission to edit
-  const editableWikis = db.prepare(`
+  // Change ? to $1, $2
+  const editableRes = await pool.query(`
     SELECT w.* FROM wikis w 
     JOIN wiki_permissions wp ON w.id = wp.wiki_id 
-    WHERE wp.editor_id = ? AND w.owner_id != ? AND w.deleted_at IS NULL
-  `).all(userId, userId);
+    WHERE wp.editor_id = $1 AND w.owner_id != $2 AND w.deleted_at IS NULL
+  `, [userId, userId]);
+  const editableWikis = editableRes.rows;
   
-  // Get recent edits by user
-  const recentEdits = db.prepare(`
+  const recentRes = await pool.query(`
     SELECT p.name as page_name, w.name as wiki_name, w.address as wiki_address, r.created_at
     FROM revisions r
     JOIN pages p ON r.page_id = p.id 
     JOIN wikis w ON p.wiki_id = w.id
-    WHERE r.editor_id = ? AND w.deleted_at IS NULL AND p.deleted_at IS NULL
+    WHERE r.editor_id = $1 AND w.deleted_at IS NULL AND p.deleted_at IS NULL
     ORDER BY r.created_at DESC LIMIT 10
-  `).all(userId);
+  `, [userId]);
+  const recentEdits = recentRes.rows;
 
   const body = `
     <div class="breadcrumb"><a href="/">🏠 ${getText('home', lang)}</a> > 📊 ${getText('dashboard', lang)}</div>
@@ -1605,8 +1607,11 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
   }
 
   const now = new Date().toISOString();
-  const info = db.prepare('INSERT INTO wikis(name, address, favicon, owner_id, created_at) VALUES (?,?,?,?,?)').run(wname, slug, faviconPath, req.user.id, now);
-
+  const res = await pool.query(
+    'INSERT INTO wikis(name, address, favicon, owner_id, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
+    [wname, slug, faviconPath, req.user.id, now]
+  );
+  
   // create default home page
   const welcomeText = lang === 'ja' ? 
     `# ${wname}\n\n🎉 このWikiへようこそ！\n\n## はじめに\nこのページを編集してWikiを構築しましょう。\n\n## 機能\n- 📝 Markdownでページ作成\n- 🖼️ 画像アップロード対応\n- 🌓 ダークテーマ切替\n- 📱 レスポンシブデザイン\n- 📚 改訂履歴` :
@@ -2274,7 +2279,8 @@ app.get('/:address/:page', (req, res) => {
   }
 
   try {
-    db.prepare('UPDATE wikis SET views = COALESCE(views, 0) + 1 WHERE id = ?').run(wiki.id);
+    // Change ? to $1 and use pool.query
+    pool.query('UPDATE wikis SET views = COALESCE(views, 0) + 1 WHERE id = $1', [wiki.id]);
   } catch (e) {
     console.warn('views update failed', e.message);
   }
