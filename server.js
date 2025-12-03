@@ -431,22 +431,17 @@ const getText = (key, lang = 'ja') => i18n[lang] && i18n[lang][key] ? i18n[lang]
 
 const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
     let suspensionBanner = '';
-    [cite_start]// アカウント停止状態のチェック [cite: 2, 123]
     if (req && req.isSuspended) {
         const details = req.suspensionDetails;
         suspensionBanner = `
           <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 20px; border-color: var(--danger-color);">
-            <h3 style="margin-top:0; color: white;">${lang === 'ja' ?
-            'アカウントが停止されています' : 'Account Suspended'}</h3>
-            <p style="margin-bottom:0;">${lang === 'ja' ?
-            '理由' : 'Reason'}: ${details.reason}</p>
+            <h3 style="margin-top:0; color: white;">${lang === 'ja' ? 'アカウントが停止されています' : 'Account Suspended'}</h3>
+            <p style="margin-bottom:0;">${lang === 'ja' ? '理由' : 'Reason'}: ${details.reason}</p>
           </div>
         `;
     }
-    
-    [cite_start]// ファビコンの設定 [cite: 6, 127]
-    const faviconTag = favicon ?
-        `<link rel="icon" href="${favicon}">` : '<link rel="icon" href="/public/Icon.png">';
+    // 変更: デフォルトファビコンの設定
+    const faviconTag = favicon ? `<link rel="icon" href="${favicon}">` : '<link rel="icon" href="/public/Icon.png">';
 
     return `<!doctype html>
 <html lang="${lang}">
@@ -464,7 +459,8 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
   <meta name="twitter:card" content="summary_large_image">
   ${faviconTag}
 
-  <link rel="manifest" href="/public/manifest.json">
+    <link rel="manifest" href="/public/manifest.json">
+  <meta name="theme-color" content="#3498db">
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/public/service-worker.js');
@@ -526,7 +522,7 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
     .header-left, .header-right { 
       display: flex; 
       align-items: center; 
-      gap: 12px;
+      gap: 12px; 
       flex: 1;
     }
     .desktop-header-items {
@@ -630,7 +626,7 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
     .language-option:hover { background-color: var(--button-hover); }
     .language-option.active { background-color: var(--accent-color); color: white; }
     
-    [cite_start]/* Mobile Drawer Styles [cite: 43-59] */
+    /* Mobile Drawer Styles */
     .mobile-drawer-button {
       background: none;
       border: 1px solid var(--border-color);
@@ -680,8 +676,12 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
       cursor: pointer;
       color: var(--text-primary);
     }
-    .drawer-content { padding: 20px; }
-    .drawer-section { margin-bottom: 24px; }
+    .drawer-content {
+      padding: 20px;
+    }
+    .drawer-section {
+      margin-bottom: 24px;
+    }
     .drawer-section h3 {
       margin: 0 0 12px 0;
       font-size: 16px;
@@ -705,7 +705,6 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
     .drawer-option:hover { background-color: var(--button-hover); }
     .drawer-option.active { background-color: var(--accent-color); color: white; border-color: var(--accent-color); }
 
-    [cite_start]/* Bottom Navigation Styles [cite: 59-63] */
     .bottom-nav {
       position: fixed;
       bottom: 0;
@@ -730,17 +729,7 @@ const renderLayout = (title, body, favicon = null, lang = 'ja', req = null) => {
     }
     .nav-item:hover, .nav-item.active { color: var(--accent-color); }
     .nav-icon { font-size: 20px; margin-bottom: 4px; }
-    
-    input, textarea, select { 
-      width: 100%;
-      padding: 12px; 
-      border: 1px solid var(--border-color); 
-      border-radius: 8px; 
-      background-color: var(--card-bg); 
-      color: var(--text-primary); 
-      font-size: 14px; 
-      transition: border-color 0.2s ease;
-    }
+    input, textarea, select { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; background-color: var(--card-bg); color: var(--text-primary); font-size: 14px; transition: border-color 0.2s ease; }
     input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent-color); box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1); }
     textarea { min-height: 400px; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; resize: vertical; }
     .form-group { margin-bottom: 20px; }
@@ -840,7 +829,6 @@ ${suspensionBanner}
 </div>
 
 ${body}
-
 <nav class="bottom-nav">
   <a href="/" class="nav-item">
     <div class="nav-icon">🏠</div>
@@ -865,7 +853,7 @@ ${body}
 </nav>
 
 <script>
-[cite_start]// Theme Toggle Function [cite: 98-101]
+// Theme Toggle Function
 function toggleTheme() {
   const body = document.body;
   const newTheme = body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
@@ -890,7 +878,7 @@ function toggleLanguageDropdown() {
   menu.classList.toggle('show');
 }
 
-[cite_start]// Mobile Drawer Functions [cite: 102-103]
+// Mobile Drawer Functions
 function toggleMobileDrawer() {
   const drawer = document.getElementById('mobile-drawer');
   const overlay = document.getElementById('drawer-overlay');
@@ -909,7 +897,7 @@ function closeMobileDrawer() {
 document.body.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
 updateThemeText();
 
-[cite_start]// Close dropdowns when clicking outside [cite: 104, 171]
+// Close dropdowns when clicking outside
 document.addEventListener('click', function(event) {
   const languageDropdown = document.querySelector('.language-dropdown');
   const languageMenu = document.getElementById('language-menu');
@@ -925,7 +913,7 @@ document.addEventListener('click', function(event) {
   }
 });
 
-[cite_start]// Authentication handling [cite: 105-120]
+// Authentication handling
 fetch('/api/me').then(r => r.json()).then(me => {
   const el = document.getElementById('auth');
   const adminNav = document.getElementById('admin-nav');
