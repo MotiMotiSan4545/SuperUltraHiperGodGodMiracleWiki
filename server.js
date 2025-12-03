@@ -192,7 +192,7 @@ async function initDatabase() {
 
     // Seed Allowed User
     await client.query(
-      'INSERT INTO allowed_users(user_id) VALUES ($1 (¥156)) ON CONFLICT DO NOTHING',
+      'INSERT INTO allowed_users(user_id) VALUES ($1) ON CONFLICT DO NOTHING',
       ['1047797479665578014']
     );
 
@@ -309,7 +309,7 @@ passport.use(new DiscordStrategy({
       const now = new Date();
       await pool.query(`
         INSERT INTO user_profiles (user_id, display_name, email, created_at, last_login_at) 
-        VALUES ($1 (¥156), <span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>, &lt;span class="currency-converted" title="自動変換: $3 → ¥467" data-original="$3" data-jpy="467" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$3 (¥467)&lt;/span&gt;, &amp;lt;span class="currency-converted" title="自動変換: $4 → ¥623" data-original="$4" data-jpy="623" style="color: rgb(33, 150, 243); font-weight: bold;"&amp;gt;$4 (¥623)&amp;lt;/span&amp;gt;, &amp;amp;lt;span class="currency-converted" title="自動変換: $5 → ¥779" data-original="$5" data-jpy="779" style="color: rgb(33, 150, 243); font-weight: bold;"&amp;amp;gt;$5 (¥779)&amp;amp;lt;/span&amp;amp;gt;) 
+        VALUES ($1, $2, $3, $4, $5) 
         ON CONFLICT(user_id) DO UPDATE SET 
         display_name = EXCLUDED.display_name, 
         email = EXCLUDED.email,
@@ -348,10 +348,10 @@ app.use(async (req, res, next) => {
     req.isSuspended = false;
     if (req.isAuthenticated()) {
         try {
-          const langRes = await pool.query('SELECT language FROM user_languages WHERE user_id = $1 (¥156)', [req.user.id]);
+          const langRes = await pool.query('SELECT language FROM user_languages WHERE user_id = $1', [req.user.id]);
           req.userLang = langRes.rows[0] ? langRes.rows[0].language : 'ja';
 
-          const suspRes = await pool.query('SELECT * FROM user_suspensions WHERE user_id = $1 (¥156) AND (expires_at IS NULL OR expires_at > NOW()) LIMIT 1', [req.user.id]);
+          const suspRes = await pool.query('SELECT * FROM user_suspensions WHERE user_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) LIMIT 1', [req.user.id]);
           if (suspRes.rows.length > 0) {
               req.isSuspended = true;
               req.suspensionDetails = suspRes.rows[0];
@@ -406,7 +406,7 @@ const ensureCanAdministerWiki = async (req, res, next) => {
   const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ Wiki not found.</p></div>`, null, req.userLang, req));
 
-  const permRes = await pool.query('SELECT role FROM wiki_permissions WHERE wiki_id = $1 (¥156) AND editor_id = <span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>', [wiki.id, req.user.id]);
+  const permRes = await pool.query('SELECT role FROM wiki_permissions WHERE wiki_id = $1 AND editor_id = $2', [wiki.id, req.user.id]);
   const perm = permRes.rows[0];
   
   if (wiki.owner_id === req.user.id || (perm && perm.role === 'admin') || ADMIN_USERS.includes(req.user.id)) {
@@ -418,12 +418,12 @@ const ensureCanAdministerWiki = async (req, res, next) => {
 
 // Async DB Helpers
 const wikiByAddress = async (address) => {
-  const res = await pool.query('SELECT * FROM wikis WHERE address = $1 (¥156) AND deleted_at IS NULL', [address]);
+  const res = await pool.query('SELECT * FROM wikis WHERE address = $1 AND deleted_at IS NULL', [address]);
   return res.rows[0];
 };
 
 const pageByWikiAndName = async (wikiId, name) => {
-  const res = await pool.query('SELECT * FROM pages WHERE wiki_id = $1 (¥156) AND name = <span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span> AND deleted_at IS NULL', [wikiId, name]);
+  const res = await pool.query('SELECT * FROM pages WHERE wiki_id = $1 AND name = $2 AND deleted_at IS NULL', [wikiId, name]);
   return res.rows[0];
 };
 
@@ -1255,8 +1255,8 @@ app.get('/api/admin/activities', ensureAdmin, (req, res) => {
 
 app.get('/api/admin/user/:userId', ensureAdmin, async (req, res) => {
   const { userId } = req.params;
-  const warnings = await pool.query('SELECT * FROM user_warnings WHERE user_id = $1 (¥156) ORDER BY created_at DESC', [userId]);
-  const suspension = await pool.query('SELECT * FROM user_suspensions WHERE user_id = $1 (¥156) AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 1', [userId]);
+  const warnings = await pool.query('SELECT * FROM user_warnings WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+  const suspension = await pool.query('SELECT * FROM user_suspensions WHERE user_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 1', [userId]);
   
   let discordUser = { id: userId, username: 'Unknown' };
   try {
@@ -1273,7 +1273,7 @@ app.post('/api/admin/user/:userId/warn', ensureAdmin, async (req, res) => {
   const { userId } = req.params;
   const { reason } = req.body;
   if (!reason) return res.status(400).json({ error: 'Reason required' });
-  await pool.query('INSERT INTO user_warnings(user_id, reason, issued_by) VALUES ($1 (¥156),<span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>,&lt;span class="currency-converted" title="自動変換: $3 → ¥467" data-original="$3" data-jpy="467" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$3 (¥467)&lt;/span&gt;)', [userId, reason, req.user.id]);
+  await pool.query('INSERT INTO user_warnings(user_id, reason, issued_by) VALUES ($1,$2,$3)', [userId, reason, req.user.id]);
   res.json({ success: true });
 });
 
@@ -1287,21 +1287,21 @@ app.post('/api/admin/user/:userId/suspend', ensureAdmin, async (req, res) => {
     expiresAt = d;
     type = 'temporary';
   }
-  await pool.query('INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1 (¥156),<span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>,&lt;span class="currency-converted" title="自動変換: $3 → ¥467" data-original="$3" data-jpy="467" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$3 (¥467)&lt;/span&gt;,&amp;lt;span class="currency-converted" title="自動変換: $4 → ¥623" data-original="$4" data-jpy="623" style="color: rgb(33, 150, 243); font-weight: bold;"&amp;gt;$4 (¥623)&amp;lt;/span&amp;gt;,&amp;amp;lt;span class="currency-converted" title="自動変換: $5 → ¥779" data-original="$5" data-jpy="779" style="color: rgb(33, 150, 243); font-weight: bold;"&amp;amp;gt;$5 (¥779)&amp;amp;lt;/span&amp;amp;gt;)', [userId, type, reason, req.user.id, expiresAt]);
+  await pool.query('INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1,$2,$3,$4,$5)', [userId, type, reason, req.user.id, expiresAt]);
   res.json({ success: true });
 });
 
 app.post('/api/admin/user/:userId/ban', ensureAdmin, async (req, res) => {
   const { userId } = req.params;
   const { reason } = req.body;
-  await pool.query('INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1 (¥156),<span class="currency-converted" title="自動変換: $2 → ¥312" data-original="$2" data-jpy="312" style="color: rgb(33, 150, 243); font-weight: bold;">$2 (¥312)</span>,&lt;span class="currency-converted" title="自動変換: $3 → ¥467" data-original="$3" data-jpy="467" style="color: rgb(33, 150, 243); font-weight: bold;"&gt;$3 (¥467)&lt;/span&gt;,&amp;lt;span class="currency-converted" title="自動変換: $4 → ¥623" data-original="$4" data-jpy="623" style="color: rgb(33, 150, 243); font-weight: bold;"&amp;gt;$4 (¥623)&amp;lt;/span&amp;gt;,NULL)', [userId, 'permanent', reason, req.user.id]);
+  await pool.query('INSERT INTO user_suspensions(user_id, type, reason, issued_by, expires_at) VALUES ($1,$2,$3,$4,NULL)', [userId, 'permanent', reason, req.user.id]);
   res.json({ success: true });
 });
 
 app.delete('/api/admin/wiki/:wikiId', ensureAdmin, async (req, res) => {
   const { wikiId } = req.params;
-  await pool.query('UPDATE wikis SET deleted_at = NOW() WHERE id = $1 (¥156)', [wikiId]);
-  await pool.query('UPDATE pages SET deleted_at = NOW() WHERE wiki_id = $1 (¥156)', [wikiId]);
+  await pool.query('UPDATE wikis SET deleted_at = NOW() WHERE id = $1', [wikiId]);
+  await pool.query('UPDATE pages SET deleted_at = NOW() WHERE wiki_id = $1', [wikiId]);
   res.json({ success: true });
 });
 
