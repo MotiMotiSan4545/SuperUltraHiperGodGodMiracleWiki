@@ -976,14 +976,20 @@ function toggleUserMenu() {
 }
 
 // --- Language Routes ---
-app.get('/lang/:lang', (req, res) => {
+// --- 修正後のコード ---
+app.get('/lang/:lang', async (req, res) => { // asyncを追加
   const { lang } = req.params;
   if (!['ja', 'en'].includes(lang)) {
     return res.redirect('/');
   }
   
   if (req.isAuthenticated()) {
-    db.prepare('INSERT OR REPLACE INTO user_languages(user_id, language) VALUES (?, ?)').run(req.user.id, lang);
+    // PostgreSQL用のUPSERT構文に変更
+    await pool.query(`
+      INSERT INTO user_languages(user_id, language) 
+      VALUES ($1, $2) 
+      ON CONFLICT(user_id) DO UPDATE SET language = $2
+    `, [req.user.id, lang]);
   } else {
     req.session.language = lang;
   }
@@ -1596,8 +1602,8 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
     return res.status(400).send(renderLayout('Error', `<div class="card"><p class="danger">❌ ${lang === 'ja' ? 'Wiki名は必須です。' : 'Wiki name is required.'}</p><a class="btn" href="/create-wiki">🔙 ${lang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, lang, req));
   }
 
-  const exists = db.prepare('SELECT 1 FROM wikis WHERE name = ? OR address = ?').get(wname, slug);
-  if (exists) {
+  const existsRes = await pool.query('SELECT 1 FROM wikis WHERE name = $1 OR address = $2', [wname, slug]);
+  if (existsRes.rows.length > 0) {
     return res.status(409).send(renderLayout('Duplicate', `<div class="card"><p class="danger">❌ ${lang === 'ja' ? 'Wiki名またはアドレスが既に使用されています。' : 'The Wiki Name or Address is already in use.'}</p><a class="btn" href="/create-wiki">🔙 ${lang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, lang, req));
   }
 
@@ -1607,41 +1613,57 @@ app.post('/create-wiki', ensureCanCreate, upload.single('faviconFile'), async (r
   }
 
   const now = new Date().toISOString();
-  const dbRes = await pool.query(
-    'INSERT INTO wikis(name, address, favicon, owner_id, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
-    [wname, slug, faviconPath, req.user.id, now]
-  );
 
-  const wikiId = dbRes.rows[0].id;
-  
-  // create default home page
-  const welcomeText = lang === 'ja' ? 
-    `# ${wname}\n\n🎉 このWikiへようこそ！\n\n## はじめに\nこのページを編集してWikiを構築しましょう。\n\n## 機能\n- 📝 Markdownでページ作成\n- 🖼️ 画像アップロード対応\n- 🌓 ダークテーマ切替\n- 📱 レスポンシブデザイン\n- 📚 改訂履歴` :
-    `# ${wname}\n\n🎉 Welcome to this Wiki!\n\n## Getting Started\nEdit this page to start building your wiki.\n\n## Features\n- 📝 Create pages with Markdown\n- 🖼️ Image upload support\n- 🌓 Dark theme toggle\n- 📱 Responsive design\n- 📚 Revision history`;
+  try {
+    await pool.query('BEGIN'); // トランザクション開始
 
-  db.prepare('INSERT INTO pages(wiki_id, name, content, updated_at) VALUES (?,?,?,?)').run(info.lastInsertRowid, 'home', welcomeText, now);
+    // Wiki作成 (RETURNING id でIDを取得)
+    const wikiRes = await pool.query(
+      'INSERT INTO wikis(name, address, favicon, owner_id, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
+      [wname, slug, faviconPath, req.user.id, now]
+    );
+    const wikiId = wikiRes.rows[0].id;
 
-  // set wiki_settings with initialMode
-  const mode = ['anyone', 'loggedin', 'invite'].includes(initialMode) ? initialMode : 'loggedin';
-  // is_searchable はデフォルトで1(ON)が設定される
-  db.prepare('INSERT OR REPLACE INTO wiki_settings(wiki_id, mode) VALUES (?,?)').run(info.lastInsertRowid, mode);
+    const welcomeText = lang === 'ja' ? 
+      `# ${wname}\n\n🎉 このWikiへようこそ！\n\n## はじめに\nこのページを編集してWikiを構築しましょう。\n\n## 機能\n- 📝 Markdownでページ作成\n- 🖼️ 画像アップロード対応\n- 🌓 ダークテーマ切替\n- 📱 レスポンシブデザイン\n- 📚 改訂履歴` :
+      `# ${wname}\n\n🎉 Welcome to this Wiki!\n\n## Getting Started\nEdit this page to start building your wiki.\n\n## Features\n- 📝 Create pages with Markdown\n- 🖼️ Image upload support\n- 🌓 Dark theme toggle\n- 📱 Responsive design\n- 📚 Revision history`;
 
-  // owner always has admin permissions
-  db.prepare('INSERT OR REPLACE INTO wiki_permissions(wiki_id, editor_id, role) VALUES (?,?,?)').run(info.lastInsertRowid, req.user.id, 'admin');
+    // ホームページ作成
+    await pool.query(
+      'INSERT INTO pages(wiki_id, name, content, updated_at) VALUES ($1, $2, $3, $4)',
+      [wikiId, 'home', welcomeText, now]
+    );
 
-  // 4. Wiki作成成功後、最終作成時刻を更新 - 一時的に無効化
-  // TODO: user_profiles テーブルに last_wiki_created_at カラムを追加してから有効化
-  // db.prepare('UPDATE user_profiles SET last_wiki_created_at = ? WHERE user_id = ?').run(now, req.user.id);
+    // 設定保存
+    const mode = ['anyone', 'loggedin', 'invite'].includes(initialMode) ? initialMode : 'loggedin';
+    await pool.query(
+      'INSERT INTO wiki_settings(wiki_id, mode) VALUES ($1, $2)',
+      [wikiId, mode]
+    );
 
-  res.redirect(`/${slug}-edit`);
+    // 権限設定
+    await pool.query(
+      'INSERT INTO wiki_permissions(wiki_id, editor_id, role) VALUES ($1, $2, $3)',
+      [wikiId, req.user.id, 'admin']
+    );
+
+    await pool.query('COMMIT'); // コミット
+    res.redirect(`/${slug}-edit`);
+
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error(err);
+    res.status(500).send("Database Error");
+  }
 });
 
 // Helper: check if user can edit wiki
-const ensureCanEdit = (req, res, next) => {
+// --- 修正後のコード ---
+const ensureCanEdit = async (req, res, next) => { // asyncを追加
   if (!req.isAuthenticated()) return res.redirect('/auth/discord');
   if (req.isSuspended) return res.status(403).send(createSuspensionBlock(req));
   const address = req.params.address;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address); // awaitが必要
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${req.userLang === 'ja' ? 'Wikiが見つかりません' : 'Wiki not found'}.</p></div>`, null, req.userLang, req));
 
   // owner -> allowed
@@ -1651,35 +1673,40 @@ const ensureCanEdit = (req, res, next) => {
   if (ADMIN_USERS.includes(req.user.id)) return next();
 
   // explicit permission
-  const perm = db.prepare('SELECT * FROM wiki_permissions WHERE wiki_id = ? AND editor_id = ?').get(wiki.id, req.user.id);
-  if (perm) return next();
+  const permRes = await pool.query('SELECT * FROM wiki_permissions WHERE wiki_id = $1 AND editor_id = $2', [wiki.id, req.user.id]);
+  if (permRes.rows.length > 0) return next();
 
   // check wiki_settings
-  const setting = db.prepare('SELECT mode FROM wiki_settings WHERE wiki_id = ?').get(wiki.id);
+  const settingRes = await pool.query('SELECT mode FROM wiki_settings WHERE wiki_id = $1', [wiki.id]);
+  const setting = settingRes.rows[0];
   const mode = setting ? setting.mode : 'loggedin';
 
   if (mode === 'anyone') return next();
-  if (mode === 'loggedin') return next(); // any logged-in user allowed
-  // mode === 'invite' -> only invited users (we already checked wiki_permissions)
+  if (mode === 'loggedin') return next(); 
+  
   return res.status(403).send(renderLayout('Forbidden', `<div class="card"><p class="danger">❌ ${req.userLang === 'ja' ? '編集権限がありません' : 'No edit permission'}.</p><a class="btn" href="/${wiki.address}">${req.userLang === 'ja' ? '戻る' : 'Back'}</a></div>`, null, req.userLang, req));
 };
 
 // --- Edit dashboard ---
-app.get('/:address-edit', ensureCanEdit, (req, res) => {
+app.get('/:address-edit', ensureCanEdit, async (req, res) => { // asyncを追加
   const lang = req.userLang;
-  const wiki = wikiByAddress(req.params.address);
+  const wiki = await wikiByAddress(req.params.address); // await
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p><a class="btn" href="/">🏠 ${getText('home', lang)}</a></div>`, null, lang, req));
 
   // pages
-  const pages = db.prepare('SELECT name FROM pages WHERE wiki_id = ? AND deleted_at IS NULL ORDER BY name ASC').all(wiki.id);
+  const pagesRes = await pool.query('SELECT name FROM pages WHERE wiki_id = $1 AND deleted_at IS NULL ORDER BY name ASC', [wiki.id]);
+  const pages = pagesRes.rows;
   const allPages = pages.map(p => `<a class="chip" href="/${wiki.address}/${encodeURIComponent(p.name)}/edit">📄 ${p.name}</a>`).join('');
-  const settings = db.prepare('SELECT mode, is_searchable FROM wiki_settings WHERE wiki_id = ?').get(wiki.id) || { mode: 'loggedin', is_searchable: 1 };
-  const perms = db.prepare('SELECT editor_id, role FROM wiki_permissions WHERE wiki_id = ?').all(wiki.id);
-  const invites = db.prepare('SELECT id, invited_tag, invited_id, role, created_at FROM wiki_invites WHERE wiki_id = ? ORDER BY created_at DESC').all(wiki.id);
-
-  const permsHtml = perms.map(p => `<div><strong>${p.editor_id}</strong> — <span class="muted">${p.role}</span></div>`).join('') || `<div class="muted">${lang === 'ja' ? '明示的な編集者なし' : 'No explicit editors'}</div>`;
-  const invitesHtml = invites.map(i => `<div><strong>${i.invited_tag || (i.invited_id || '—')}</strong> — <span class="muted">${i.role}</span> <small class="muted">(${new Date(i.created_at).toLocaleString()})</small></div>`).join('') || `<div class="muted">${lang === 'ja' ? '保留中の招待なし' : 'No pending invites'}</div>`;
-
+  
+  const settingsRes = await pool.query('SELECT mode, is_searchable FROM wiki_settings WHERE wiki_id = $1', [wiki.id]);
+  const settings = settingsRes.rows[0] || { mode: 'loggedin', is_searchable: 1 };
+  
+  const permsRes = await pool.query('SELECT editor_id, role FROM wiki_permissions WHERE wiki_id = $1', [wiki.id]);
+  const permsHtml = permsRes.rows.map(p => `<div><strong>${p.editor_id}</strong> — <span class="muted">${p.role}</span></div>`).join('') || `<div class="muted">${lang === 'ja' ? '明示的な編集者なし' : 'No explicit editors'}</div>`;
+  
+  const invitesRes = await pool.query('SELECT id, invited_tag, invited_id, role, created_at FROM wiki_invites WHERE wiki_id = $1 ORDER BY created_at DESC', [wiki.id]);
+  const invitesHtml = invitesRes.rows.map(i => `<div><strong>${i.invited_tag || (i.invited_id || '—')}</strong> — <span class="muted">${i.role}</span> <small class="muted">(${new Date(i.created_at).toLocaleString()})</small></div>`).join('') || `<div class="muted">${lang === 'ja' ? '保留中の招待なし' : 'No pending invites'}</div>`;
+  
   // 変更: ユーザーが管理者かWikiオーナーかを確認
   const isOwner = wiki.owner_id === req.user.id;
   const isAdmin = ADMIN_USERS.includes(req.user.id);
@@ -1827,110 +1854,128 @@ app.get('/:address-edit', ensureCanEdit, (req, res) => {
 });
 
 // --- Remaining routes with full implementation ---
-app.post('/:address/favicon', ensureCanAdministerWiki, upload.single('faviconFile'), (req, res) => {
-  const wiki = wikiByAddress(req.params.address);
+app.post('/:address/favicon', ensureCanAdministerWiki, upload.single('faviconFile'), async (req, res) => { // async
+  const wiki = await wikiByAddress(req.params.address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ Wiki not found.</p></div>`, null, req.userLang, req));
 
   let faviconPath = req.body.faviconUrl || null;
   if (req.file) faviconPath = `/uploads/${req.file.filename}`;
-  db.prepare('UPDATE wikis SET favicon = ? WHERE id = ?').run(faviconPath, wiki.id);
+  await pool.query('UPDATE wikis SET favicon = $1 WHERE id = $2', [faviconPath, wiki.id]); // $1, $2
   res.redirect(`/${wiki.address}-edit`);
 });
 
-app.post('/:address/settings', ensureCanAdministerWiki, (req, res) => {
-  const wiki = wikiByAddress(req.params.address);
+app.post('/:address/settings', ensureCanAdministerWiki, async (req, res) => { // async
+  const wiki = await wikiByAddress(req.params.address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ Wiki not found.</p></div>`, null, req.userLang, req));
   
   const mode = ['anyone', 'loggedin', 'invite'].includes(req.body.mode) ? req.body.mode : 'loggedin';
-  
-  // 変更: is_searchable の値も処理
   const isSearchable = req.body.is_searchable === 'on' ? 1 : 0;
-  
   const isOwner = wiki.owner_id === req.user.id;
   const isAdmin = ADMIN_USERS.includes(req.user.id);
 
   if (isOwner || isAdmin) {
-    // 管理者かオーナーは両方の設定を更新可能
-    db.prepare(`
+    // ON CONFLICT 構文
+    await pool.query(`
       INSERT INTO wiki_settings (wiki_id, mode, is_searchable) 
-      VALUES (?, ?, ?) 
+      VALUES ($1, $2, $3) 
       ON CONFLICT(wiki_id) DO UPDATE SET 
         mode = excluded.mode, 
         is_searchable = excluded.is_searchable
-    `).run(wiki.id, mode, isSearchable);
+    `, [wiki.id, mode, isSearchable]);
   } else {
-    // それ以外のユーザー (Wikiの管理者ロールなど) は mode のみ更新
-    db.prepare('UPDATE wiki_settings SET mode = ? WHERE wiki_id = ?').run(mode, wiki.id);
+    await pool.query('UPDATE wiki_settings SET mode = $1 WHERE wiki_id = $2', [mode, wiki.id]);
   }
-
   res.redirect(`/${wiki.address}-edit`);
 });
 
-app.post('/:address/permissions', ensureCanAdministerWiki, (req, res) => {
-  const wiki = wikiByAddress(req.params.address);
+app.post('/:address/permissions', ensureCanAdministerWiki, async (req, res) => { // async
+  const wiki = await wikiByAddress(req.params.address);
   if (!wiki) return res.status(404).json({ error: 'not found' });
   const { editor_id, role } = req.body;
   if (!editor_id) return res.status(400).json({ error: 'missing editor_id' });
-  db.prepare('INSERT OR REPLACE INTO wiki_permissions(wiki_id, editor_id, role) VALUES (?,?,?)').run(wiki.id, editor_id, role || 'editor');
+  
+  // INSERT OR REPLACE -> INSERT ... ON CONFLICT
+  await pool.query(`
+    INSERT INTO wiki_permissions(wiki_id, editor_id, role) 
+    VALUES ($1, $2, $3)
+    ON CONFLICT(wiki_id, editor_id) DO UPDATE SET role = $3
+  `, [wiki.id, editor_id, role || 'editor']);
   res.json({ success: true });
 });
 
-app.post('/:address/invite', ensureCanAdministerWiki, (req, res) => {
-  const wiki = wikiByAddress(req.params.address);
+app.post('/:address/invite', ensureCanAdministerWiki, async (req, res) => { // async
+  const wiki = await wikiByAddress(req.params.address);
   if (!wiki) return res.status(404).json({ error: 'not found' });
   const { invited_tag, role } = req.body;
   if (!invited_tag) return res.status(400).json({ error: 'missing invited_tag' });
   const now = new Date().toISOString();
-  db.prepare('INSERT INTO wiki_invites(wiki_id, invited_tag, role, created_at) VALUES (?,?,?,?)').run(wiki.id, invited_tag, role || 'editor', now);
+  await pool.query('INSERT INTO wiki_invites(wiki_id, invited_tag, role, created_at) VALUES ($1, $2, $3, $4)', [wiki.id, invited_tag, role || 'editor', now]);
   res.json({ success: true });
 });
 
 // --- API: list invites for logged in user ---
-app.get('/api/my-invites', ensureAuth, (req, res) => {
+app.get('/api/my-invites', ensureAuth, async (req, res) => { // async
   const tag = `${req.user.username}#${req.user.discriminator}`;
-  const invites = db.prepare('SELECT id, wiki_id, invited_tag, role, created_at FROM wiki_invites WHERE invited_tag = ? AND invited_id IS NULL').all(tag);
-  const detailed = invites.map(i => {
-    const w = db.prepare('SELECT id, name, address FROM wikis WHERE id = ? AND deleted_at IS NULL').get(i.wiki_id);
-    return { inviteId: i.id, wiki: w, role: i.role, created_at: i.created_at };
-  }).filter(i => i.wiki); // filter out deleted wikis
+  // 配列をawait処理する必要があるためロジック微修正
+  const invitesRes = await pool.query('SELECT id, wiki_id, invited_tag, role, created_at FROM wiki_invites WHERE invited_tag = $1 AND invited_id IS NULL', [tag]);
+  
+  const detailed = [];
+  for (const i of invitesRes.rows) {
+    const wRes = await pool.query('SELECT id, name, address FROM wikis WHERE id = $1 AND deleted_at IS NULL', [i.wiki_id]);
+    const w = wRes.rows[0];
+    if (w) {
+      detailed.push({ inviteId: i.id, wiki: w, role: i.role, created_at: i.created_at });
+    }
+  }
   res.json({ invites: detailed });
 });
 
-app.post('/invite/:inviteId/accept', ensureAuth, (req, res) => {
+app.post('/invite/:inviteId/accept', ensureAuth, async (req, res) => { // async
   if (req.isSuspended) return res.status(403).json({ error: 'Account suspended' });
   const inviteId = parseInt(req.params.inviteId, 10);
-  const invite = db.prepare('SELECT * FROM wiki_invites WHERE id = ?').get(inviteId);
+  const inviteRes = await pool.query('SELECT * FROM wiki_invites WHERE id = $1', [inviteId]);
+  const invite = inviteRes.rows[0];
   if (!invite) return res.status(404).json({ error: 'invite not found' });
 
   const tag = `${req.user.username}#${req.user.discriminator}`;
   if (invite.invited_tag !== tag) return res.status(403).json({ error: 'tag mismatch' });
 
-  db.prepare('UPDATE wiki_invites SET invited_id = ? WHERE id = ?').run(req.user.id, inviteId);
-  db.prepare('INSERT OR REPLACE INTO wiki_permissions(wiki_id, editor_id, role) VALUES (?,?,?)').run(invite.wiki_id, req.user.id, invite.role || 'editor');
-
-  res.json({ success: true });
+  await pool.query('BEGIN');
+  try {
+    await pool.query('UPDATE wiki_invites SET invited_id = $1 WHERE id = $2', [req.user.id, inviteId]);
+    await pool.query(`
+      INSERT INTO wiki_permissions(wiki_id, editor_id, role) 
+      VALUES ($1, $2, $3)
+      ON CONFLICT(wiki_id, editor_id) DO UPDATE SET role = $3
+    `, [invite.wiki_id, req.user.id, invite.role || 'editor']);
+    await pool.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // --- User Profile API and Page ---
-app.get('/api/user/:userId', (req, res) => {
+app.get('/api/user/:userId', async (req, res) => { // async
   const { userId } = req.params;
-  const profile = db.prepare('SELECT * FROM user_profiles WHERE user_id = ?').get(userId);
-  const badges = db.prepare('SELECT * FROM user_badges WHERE user_id = ? ORDER BY created_at DESC').all(userId);
-  const editCount = db.prepare('SELECT COUNT(*) as count FROM revisions WHERE editor_id = ?').get(userId);
-  const recentEdits = db.prepare(`
+  const profileRes = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [userId]);
+  const badgesRes = await pool.query('SELECT * FROM user_badges WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+  const editCountRes = await pool.query('SELECT COUNT(*) as count FROM revisions WHERE editor_id = $1', [userId]);
+  const recentEditsRes = await pool.query(`
     SELECT p.name as page_name, w.name as wiki_name, w.address as wiki_address
     FROM revisions r
     JOIN pages p ON r.page_id = p.id 
     JOIN wikis w ON p.wiki_id = w.id
-    WHERE r.editor_id = ? AND w.deleted_at IS NULL AND p.deleted_at IS NULL
+    WHERE r.editor_id = $1 AND w.deleted_at IS NULL AND p.deleted_at IS NULL
     ORDER BY r.created_at DESC LIMIT 5
-  `).all(userId);
+  `, [userId]);
 
   res.json({
-    profile: profile || { user_id: userId, display_name: null, bio: null },
-    badges,
-    stats: { editCount: editCount.count },
-    recentEdits
+    profile: profileRes.rows[0] || { user_id: userId, display_name: null, bio: null },
+    badges: badgesRes.rows,
+    stats: { editCount: parseInt(editCountRes.rows[0].count) },
+    recentEdits: recentEditsRes.rows
   });
 });
 
@@ -2029,16 +2074,17 @@ app.get('/user/:userId', (req, res) => {
 });
 
 // --- Page routes ---
-app.get('/:address/:page/revisions', ensureAuth, (req, res) => {
+app.get('/:address/:page/revisions', ensureAuth, async (req, res) => { // async
   if (req.isSuspended) return res.status(403).send(createSuspensionBlock(req));
   const { address, page } = req.params;
   const lang = req.userLang;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, page);
   if (!pg) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('pageNotFound', lang)}.</p></div>`, null, lang, req));
 
-  const revs = db.prepare(`SELECT id, editor_id, created_at FROM revisions WHERE page_id = ? ORDER BY id DESC`).all(pg.id);
+  const revsRes = await pool.query(`SELECT id, editor_id, created_at FROM revisions WHERE page_id = $1 ORDER BY id DESC`, [pg.id]);
+  const revs = revsRes.rows;
   const rows = revs.map((r, i) => `
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -2064,15 +2110,19 @@ app.get('/:address/:page/revisions', ensureAuth, (req, res) => {
   res.send(renderLayout(`${wiki.name}/${pg.name} ${lang === 'ja' ? '改訂履歴' : 'Revisions'}`, body, wiki.favicon, lang, req));
 });
 
-app.get('/:address/:page/revision/:revId', ensureCanAdministerWiki, (req, res) => {
+app.get('/:address/:page/revision/:revId', ensureCanAdministerWiki, async (req, res) => { // async
   const { address, page, revId } = req.params;
   const lang = req.userLang;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<p>Wiki not found</p>`, null, lang, req));
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, page); // ✅ awaitを追加
   if (!pg) return res.status(404).send(renderLayout('404', `<p>Page not found</p>`, null, lang, req));
   
-  const revision = db.prepare('SELECT * FROM revisions WHERE id = ? AND page_id = ?').get(revId, pg.id);
+  const revRes = await pool.query(
+  'SELECT * FROM revisions WHERE id = $1 AND page_id = $2',
+  [revId, pg.id]
+  );
+  const revision = revRes.rows[0];
   if (!revision) return res.status(404).send(renderLayout('404', `<p>Revision not found</p>`, null, lang, req));
 
   const diffResult = diffChars(pg.content, revision.content);
@@ -2105,33 +2155,33 @@ app.get('/:address/:page/revision/:revId', ensureCanAdministerWiki, (req, res) =
   res.send(renderLayout('View Revision', body, wiki.favicon, lang, req));
 });
 
-app.post('/:address/:page/revision/:revId/rollback', ensureCanAdministerWiki, (req, res) => {
+app.post('/:address/:page/revision/:revId/rollback', ensureCanAdministerWiki, async (req, res) => { // async
   const { address, page, revId } = req.params;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send('Wiki not found');
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, page); // ✅ awaitを追加
   if (!pg) return res.status(404).send('Page not found');
 
-  const revision = db.prepare('SELECT * FROM revisions WHERE id = ? AND page_id = ?').get(revId, pg.id);
+  const revisionRes = await pool.query('SELECT * FROM revisions WHERE id = $1 AND page_id = $2', [revId, pg.id]);
+  const revision = revisionRes.rows[0];
   if (!revision) return res.status(404).send('Revision not found');
 
   const now = new Date().toISOString();
   const rollbackContent = revision.content;
 
-  db.prepare('UPDATE pages SET content = ?, updated_at = ? WHERE id = ?').run(rollbackContent, now, pg.id);
-  
-  db.prepare('INSERT INTO revisions(page_id, content, editor_id, created_at) VALUES (?,?,?,?)').run(pg.id, rollbackContent, req.user.id, now);
+  await pool.query('UPDATE pages SET content = $1, updated_at = $2 WHERE id = $3', [rollbackContent, now, pg.id]);
+  await pool.query('INSERT INTO revisions(page_id, content, editor_id, created_at) VALUES ($1, $2, $3, $4)', [pg.id, rollbackContent, req.user.id, now]);
 
   res.redirect(`/${address}/${encodeURIComponent(page)}`);
 });
 
-app.get('/:address/:page/edit', ensureCanEdit, (req, res) => {
+app.get('/:address/:page/edit', ensureCanEdit, async (req, res) => { // async
   const { address, page } = req.params;
   const lang = req.userLang;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
 
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, req.params.page); // await
   const content = pg ? (pg.content || '') : '';
 
   const body = `
@@ -2242,32 +2292,37 @@ function hello() {
   res.send(renderLayout(`${wiki.name}/${page} ${getText('edit', lang)}`, body, wiki.favicon, lang, req));
 });
 
-app.post('/:address/:page/edit', ensureCanEdit, (req, res) => {
+app.post('/:address/:page/edit', ensureCanEdit, async (req, res) => { // async
   const { address, page } = req.params;
-  const wiki = wikiByAddress(address);
-  if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ Wiki not found.</p></div>`, null, req.userLang, req));
+  const wiki = await wikiByAddress(address);
+  if (!wiki) return res.status(404).send(renderLayout('404', 'Wiki not found', null, req.userLang, req));
 
   const now = new Date().toISOString();
   const content = (req.body.content ?? '').toString();
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, page);
 
+  let pageId;
   if (pg) {
-    db.prepare('UPDATE pages SET content = ?, updated_at = ? WHERE id = ?').run(content, now, pg.id);
-    db.prepare('INSERT INTO revisions(page_id, content, editor_id, created_at) VALUES (?,?,?,?)').run(pg.id, content, req.user.id, now);
+    await pool.query('UPDATE pages SET content = $1, updated_at = $2 WHERE id = $3', [content, now, pg.id]);
+    pageId = pg.id;
   } else {
-    const info = db.prepare('INSERT INTO pages(wiki_id, name, content, updated_at) VALUES (?,?,?,?)').run(wiki.id, page, content, now);
-    db.prepare('INSERT INTO revisions(page_id, content, editor_id, created_at) VALUES (?,?,?,?)').run(info.lastInsertRowid, content, req.user.id, now);
+    // 新規作成時は RETURNING id を使う
+    const newPageRes = await pool.query('INSERT INTO pages(wiki_id, name, content, updated_at) VALUES ($1, $2, $3, $4) RETURNING id', [wiki.id, page, content, now]);
+    pageId = newPageRes.rows[0].id;
   }
+  
+  await pool.query('INSERT INTO revisions(page_id, content, editor_id, created_at) VALUES ($1, $2, $3, $4)', [pageId, content, req.user.id, now]);
+  
   res.redirect(`/${wiki.address}/${encodeURIComponent(page)}`);
 });
 
-app.get('/:address/:page', (req, res) => {
+app.get('/:address/:page', async (req, res) => {
   const { address, page } = req.params;
   const lang = req.userLang;
-  const wiki = wikiByAddress(address);
+  const wiki = await wikiByAddress(address);
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p></div>`, null, lang, req));
 
-  const pg = pageByWikiAndName(wiki.id, page);
+  const pg = await pageByWikiAndName(wiki.id, page);
   if (!pg) {
     const isSuspended = !!req.isSuspended;
     const disabledClass = isSuspended ? 'disabled' : '';
@@ -2305,8 +2360,8 @@ app.get('/:address/:page', (req, res) => {
   res.send(renderLayout(`${wiki.name}/${pg.name}`, body, wiki.favicon, lang, req));
 });
 
-app.get('/:address', (req, res) => {
-  const wiki = wikiByAddress(req.params.address);
+app.get('/:address', async (req, res) => {
+  const wiki = await wikiByAddress(req.params.address); // ✅ awaitを追加
   const lang = req.userLang;
   if (!wiki) return res.status(404).send(renderLayout('404', `<div class="card"><p class="danger">❌ ${getText('wikiNotFound', lang)}.</p><a class="btn" href="/">🏠 ${getText('home', lang)}</a></div>`, null, lang, req));
   res.redirect(`/${wiki.address}/home`);
@@ -2314,52 +2369,40 @@ app.get('/:address', (req, res) => {
 
 
 // --- Badge Management API (Admin only) ---
-app.post('/api/user/:userId/badge', ensureAdmin, (req, res) => {
+app.post('/api/user/:userId/badge', ensureAdmin, async (req, res) => { // async
   const { userId } = req.params;
   const { badgeName, badgeColor } = req.body;
-  
-  if (!badgeName) {
-    return res.status(400).json({ error: 'Badge name required' });
-  }
+  if (!badgeName) return res.status(400).json({ error: 'Badge name required' });
   
   const now = new Date().toISOString();
-  db.prepare('INSERT INTO user_badges(user_id, badge_name, badge_color, granted_by, created_at) VALUES (?,?,?,?,?)').run(
-    userId, 
-    badgeName, 
-    badgeColor || '#3498db', 
-    req.user.id, 
-    now
-  );
+  await pool.query('INSERT INTO user_badges(user_id, badge_name, badge_color, granted_by, created_at) VALUES ($1, $2, $3, $4, $5)', 
+    [userId, badgeName, badgeColor || '#3498db', req.user.id, now]);
   
   res.json({ success: true });
 });
 
 // --- Admin Page Delete Route ---
-app.delete('/api/admin/page/:pageId', ensureAdmin, (req, res) => {
+app.delete('/api/admin/page/:pageId', ensureAdmin, async (req, res) => { // async
   const { pageId } = req.params;
   const now = new Date().toISOString();
+  const result = await pool.query('UPDATE pages SET deleted_at = $1 WHERE id = $2', [now, pageId]);
   
-  const result = db.prepare('UPDATE pages SET deleted_at = ? WHERE id = ?').run(now, pageId);
-  
-  if (result.changes === 0) {
+  if (result.rowCount === 0) { // changes ではなく rowCount
     return res.status(404).json({ error: 'Page not found' });
   }
-  
   res.json({ success: true });
 });
 
-// --- Enhanced Admin Routes for Page Management ---
-app.get('/api/admin/pages', ensureAdmin, (req, res) => {
-  const pages = db.prepare(`
+app.get('/api/admin/pages', ensureAdmin, async (req, res) => { // async
+  const pagesRes = await pool.query(`
     SELECT p.id, p.name, p.content, p.updated_at, w.name as wiki_name, w.address as wiki_address
     FROM pages p
     JOIN wikis w ON p.wiki_id = w.id
     WHERE p.deleted_at IS NULL AND w.deleted_at IS NULL
     ORDER BY p.updated_at DESC
     LIMIT 50
-  `).all();
-  
-  res.json({ pages });
+  `);
+  res.json({ pages: pagesRes.rows });
 });
 
 // --- Start server ---
