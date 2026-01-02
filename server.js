@@ -2401,16 +2401,16 @@ app.get('/:address/:page', async (req, res) => {
   }
 
   try {
-    // Change ? to $1 and use pool.query
     pool.query('UPDATE wikis SET views = COALESCE(views, 0) + 1 WHERE id = $1', [wiki.id]);
   } catch (e) {
     console.warn('views update failed', e.message);
   }
 
+  // ✅ 修正: スタブ処理を適用
   const isAdmin = req.isAuthenticated() && ADMIN_USERS.includes(req.user.id);
   const processedContent = processStubs(pg.content || '', isAdmin);
-
-  const html = sanitize(md.render(pg.content || ''));
+  const html = sanitize(md.render(processedContent)); // ← ここを変更
+  
   const isSuspended = !!req.isSuspended;
   const disabledClass = isSuspended ? 'disabled' : '';
   const body = `
