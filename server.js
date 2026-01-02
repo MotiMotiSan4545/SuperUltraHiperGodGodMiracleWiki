@@ -45,8 +45,52 @@ const dataDir = path.join(process.cwd(), 'data');
 const uploadDir = path.join(dataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
+const processStubs = (content, isAdmin = false) => {
+  return content.replace(/\[stab:(.+?)\]/g, (match, stubType) => {
+    // 削除候補は管理者のみ
+    if (stubType === '削除候補' && !isAdmin) {
+      return '';
+    }
+    return renderStub(stubType);
+  });
+};
+
 // --- Markdown renderer & sanitizer ---
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+
+const renderStub = (stubType) => {
+  const stubs = {
+    '書きかけ': {
+      title: 'この記事は書きかけです。',
+      content: 'ご存じの情報があれば加筆をお願いします。',
+      color: '#f39c12'
+    },
+    'うんこ': {
+      title: 'うんこ！w',
+      content: 'うんちうんちうんち！うんこ！ww',
+      color: '#8b4513'
+    },
+    '誤情報': {
+      title: 'この記事は正しくない情報が含まれているかもしれません',
+      content: 'でもRec Wikiでは誰もそんなこと気にしないし、処罰の対象にもなりません。',
+      color: '#e74c3c'
+    },
+    '削除候補': {
+      title: 'この記事は削除候補としてリストされています',
+      content: 'Rec Wikiコミュニティガイドラインに違反している可能性が高いため、近日削除されるかもしれません。\nまた違反が見つからなかった場合このスタブは削除されます。',
+      color: '#c0392b'
+    }
+  };
+
+  const stub = stubs[stubType];
+  if (!stub) return '';
+
+  return `<div class="stub-notice" style="background-color: ${stub.color}20; border-left: 4px solid ${stub.color}; padding: 16px; margin: 20px 0; border-radius: 8px;">
+    <h3 style="margin: 0 0 8px 0; color: ${stub.color};">⚠️ ${stub.title}</h3>
+    <p style="margin: 0; white-space: pre-line;">${stub.content}</p>
+  </div>`;
+};
+
 const sanitize = (html) =>
   sanitizeHtml(html, {
     allowedTags: sanitizeHtml.defaults.allowedTags.concat(['img', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']),
@@ -191,7 +235,7 @@ async function initDatabase() {
     `);
 
     // Seed Allowed User
-    await client.query(
+    await client.query( 
       'INSERT INTO allowed_users(user_id) VALUES ($1) ON CONFLICT DO NOTHING',
       ['1047797479665578014']
     );
@@ -1354,6 +1398,17 @@ app.get('/', (req, res) => {
 
   const body = `
     <div class="breadcrumb">🏠 ${getText('home', lang)}</div>
+
+    <div id="guidelines-banner" class="card" style="background-color: var(--accent-color); color: white; margin-bottom: 24px; border-color: var(--accent-color); display: none;">
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 16px;">
+        <p style="margin: 0;">利用の前に、コミュニティガイドラインとプライバシーポリシーをご確認ください</p>
+        <div style="display: flex; gap: 8px;">
+          <a class="btn" href="https://wiki.rec877.com/rules/home" target="_blank" style="background-color: white; color: var(--accent-color); border-color: white;">📖 閲覧</a>
+          <button class="btn" onclick="dismissGuidelines()" style="background-color: rgba(255,255,255,0.2); color: white; border-color: rgba(255,255,255,0.3);">×</button>
+        </div>
+      </div>
+    </div>
+
     <div style="text-align: center; margin-bottom: 24px;">
       <h2>Welcome to Rec Wiki</h2>
       <p class="muted">${lang === 'ja' ? 'Discord連携済み & 許可ユーザーのみWikiを新規作成できます。' : 'Only authorized users with linked Discord accounts can create new wikis.'}</p>
@@ -1369,6 +1424,16 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
+      // ガイドラインバナーの表示・非表示制御
+      if (!localStorage.getItem('guidelines-dismissed')) {
+        document.getElementById('guidelines-banner').style.display = 'block';
+      }
+
+      function dismissGuidelines() {
+        document.getElementById('guidelines-banner').style.display = 'none';
+        localStorage.setItem('guidelines-dismissed', 'true');
+      }
+
       let skip = 0;
       const limit = 10;
       const listEl = document.getElementById('wiki-list');
@@ -2341,6 +2406,9 @@ app.get('/:address/:page', async (req, res) => {
   } catch (e) {
     console.warn('views update failed', e.message);
   }
+
+  const isAdmin = req.isAuthenticated() && ADMIN_USERS.includes(req.user.id);
+  const processedContent = processStubs(pg.content || '', isAdmin);
 
   const html = sanitize(md.render(pg.content || ''));
   const isSuspended = !!req.isSuspended;
