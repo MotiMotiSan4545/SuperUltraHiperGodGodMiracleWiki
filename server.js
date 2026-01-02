@@ -2407,9 +2407,10 @@ app.get('/:address/:page', async (req, res) => {
   }
 
   // ✅ 修正: スタブ処理を適用
-  const renderedMarkdown = md.render(pg.content || ''); // 先にMarkdownを変換
-  const sanitizedHtml = sanitize(renderedMarkdown);    // 次にサニタイズ
-  const html = processStubs(sanitizedHtml, isAdmin);    // 最後にスタブを注入
+  const isAdmin = req.isAuthenticated() && ADMIN_USERS.includes(req.user.id);
+  const renderedMarkdown = md.render(pg.content || ''); 
+  const sanitizedHtml = sanitize(renderedMarkdown);    
+  const html = processStubs(sanitizedHtml, isAdmin); // これで isAdmin が使えるようになります
   
   const isSuspended = !!req.isSuspended;
   const disabledClass = isSuspended ? 'disabled' : '';
